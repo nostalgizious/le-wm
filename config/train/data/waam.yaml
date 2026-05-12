@@ -1,0 +1,33 @@
+# @package _global_
+#
+# WAAM dataset config for LeWM training.
+#
+# Render params: mirror of conf/training/default.yaml.
+# Canonical source: conf/training/default.yaml — update both if defaults change.
+#
+# NOTE: do NOT include "goal" in keys_to_load — WAAM always provides it.
+# NOTE: do NOT include "proprio" or "state" — WAAM uses "position_xy_mm".
+
+dataset:
+  type: waam
+  path: ???                  # e.g. output/datagen/randlines_20260508_132331.h5
+  frameskip: 1
+  num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+  observation_source: raw    # render from slabs ("auto" | "raw" | "pixels")
+  keys_to_load:
+    - pixels
+    - action
+    - position_xy_mm
+    - ir
+    - depth
+
+render:
+  projection_mode: 0
+  mask_empty_space: true
+  hot_threshold_k: 400.0
+  blur_kernel_size: 0
+  blur_sigma_px: 0.0
+  noise_std_norm: 0.0
+  normalize_depth: true
+  return_absolute_height: false
+  position_sigma_px: 5.0

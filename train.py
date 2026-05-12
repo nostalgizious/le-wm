@@ -51,7 +51,24 @@ def run(cfg):
     ##       dataset       ##
     #########################
 
-    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
+    if cfg.data.dataset.get("type") == "waam":
+        from src.dataloader.waam_dataset import WaamFlatDataset
+
+        render_overrides = (
+            OmegaConf.to_container(cfg.render, resolve=True)
+            if hasattr(cfg, "render") else None
+        )
+
+        dataset = WaamFlatDataset(
+            path=cfg.data.dataset.path,
+            frameskip=cfg.data.dataset.frameskip,
+            num_steps=cfg.data.dataset.num_steps,
+            keys_to_load=cfg.data.dataset.keys_to_load,
+            render_overrides=render_overrides,
+            observation_source=cfg.data.dataset.get("observation_source", "auto"),
+        )
+    else:
+        dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
     transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
     
     with open_dict(cfg):
