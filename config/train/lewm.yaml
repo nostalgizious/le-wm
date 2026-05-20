@@ -2,14 +2,18 @@ defaults:
   - _self_
   - data: pusht
 
+# Explicit keys allow struct-mode access to config-group content.
+# When data=waam, data.dataset + data.render are placed under this key.
+data: {}
+
 output_model_name: lewm
 subdir: ${hydra:job.id}
 
 num_workers: 6
 train_split: 0.9
 seed: 3072
-img_size: 224
-patch_size: 14
+img_size: 128
+patch_size: 16
 encoder_scale: tiny
 dump_object: True
 
@@ -21,7 +25,7 @@ trainer:
   gradient_clip_val: 1.0
 
 loader:
-  batch_size: 128
+  batch_size: 32
   num_workers: ${num_workers}
   persistent_workers: True
   prefetch_factor: 3
@@ -35,8 +39,8 @@ optimizer:
 wandb:
   enabled: True
   config:
-    entity: lewm
-    project: lewm
+    entity: fsandco
+    project: lwm-waam
     name: ${output_model_name}
     id: ${subdir}
     resume: allow
@@ -58,7 +62,14 @@ predictor:
 
 loss:
   sigreg:
-    weight: 0.09
+    weight: 0.2
     kwargs:
       knots: 17
       num_proj: 1024
+
+probe:
+  enabled: false  # default off; set true for validation runs
+  mlp_fit:
+    epochs: 20
+    lr: 1e-3
+    batch_size: 256

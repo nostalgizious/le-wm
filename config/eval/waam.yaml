@@ -4,33 +4,149 @@ defaults:
   - _self_
 
 world:
-  env_name: swm/PushT-v1    # placeholder — WAAM eval needs its own env wrapper
+  env_name: swm/Waam-v1
   num_envs: ${eval.num_eval}
-  max_episode_steps: ???
-  history_size: 1
-  frame_skip: 1
+  max_episode_steps: 200
 
 dataset:
   stats: ${eval.dataset_name}
   keys_to_cache:
     - action
     - position_xy_mm
+    - geom_map
 
 seed: 42
 policy: random # ckpt name or random
 
 plan_config:
-  horizon: 5
+  horizon: 25
   receding_horizon: 5
-  action_block: 5
+  action_block: ${wm.frameskip}
+  history_len: ${wm.history_size}
+  warm_start: true
 
 eval:
   num_eval: 50
   goal_offset_steps: 25
-  eval_budget: 50
-  img_size: 224
+  eval_budget: 150
+  img_size: 128
   dataset_name: ???
-  callables: []
+  callables:
+    # Restore the torch position from the dataset into the env
+    - method: _set_state
+      args:
+        state:
+          value: position_xy_mm
+    # Restore the goal geometry from the dataset into the env
+    - method: _set_goal_state
+      args:
+        goal_state:
+          value: geom_map
+
+# ── Planning-time rendering overrides ───────────────────────────────────
+# Empty = training parity.  Uncomment for robustness experiments:
+#
+#   planning_render_overrides:
+#     blur_sigma_px: 2.0
+#     noise_std_norm: 0.05
+#     projection_mode: 1
+#
+planning_render_overrides: {}
+
+# ── WAAM environment configuration ──────────────────────────────────────
+# Hydra-resolved dict passed to gym.make("swm/Waam-v1", waam_cfg=...).
+# Mirrors conf/env/default.yaml and conf/sim/default.yaml.
+#
+waam:
+  env:
+    files:
+      sim_toml: sim_cfg.toml
+    runtime:
+      device: cuda
+      precision: float32
+      max_steps: 600
+      action_mode: direct
+    writer:
+      write: false
+      write_file: output/slabs.h5
+    workspace:
+      x_min_mm: 0.0
+      x_max_mm: 128.0
+      y_min_mm: 0.0
+      y_max_mm: 128.0
+    actions:
+      min_speed_mm_s: 3.0
+      max_speed_mm_s: 30.0
+      min_wfs_m_min: 1.5
+      max_wfs_m_min: 12.0
+      max_wait_time_s: 30.0
+    observation:
+      mode: dict
+      style: real
+      goal_image_shape: [3, 128, 128]
+    camera:
+      thermal_min_k: 473.15
+      thermal_max_k: 3000.0
+      thermal_projection_mode: 0
+      ir_mask_empty_space: true
+      ir_hot_threshold_k: 400.0
+      ir_blur_kernel_size: 0
+      ir_blur_sigma_px: 0.0
+      ir_noise_std_norm: 0.0
+    goal:
+      goal_temp_delta_: 300.0
+      position_sigma_px: 3.0
+    deposition:
+      deposition_substeps: 5
+    redistribution:
+      enable_redistribution: false
+    termination:
+      terminate_on_nonfinite: true
+      terminate_on_workspace_exit: true
+      workspace_exit_is_truncation: true
+
+  sim:
+    grid:
+      dx: 1.0
+      substrate_height_mm: 8.0
+    solver:
+      phys_dt: 0.25
+      goldak_radius: 20
+      max_bead_radius_vox: 10
+    material:
+      density_s: 7855.0
+      density_l: 7360.0
+      specific_heat_s: 600.0
+      specific_heat_l: 800.0
+      thermal_conductivity: 50.0
+      T_solidus: 1770.0
+      T_liquidus: 1790.0
+      L_fusion: 2.56e5
+      T_ambient: 293.15
+      wire_superheat: 50.0
+      wire_radius: 0.0006
+    bead:
+      bead_shape_toml: bead_shapes.toml
+    redistribution:
+      redist_dep_excess_max_thresh: 0.05
+      redist_dep_excess_sum_thresh: 0.01
+      redist_dt_limit_s: 1.0
+      redist_max_iters: 3
+      redist_excess_eps: 1.0e-2
+      redist_hot_threshold_density: 0.0
+      redist_hot_full_density: 0.0
+      redist_hot_min_mobility: 0.1
+      redist_move_fraction: 0.7
+      redist_source_hot_power: 1.5
+      redist_surface_power: 0.5
+      redist_upward_bias: 2.0
+      redist_downward_bias: 1.0
+      redist_same_z_bias: 0.1
+      redist_lateral_decay_power: 2.0
+      redist_max_sources_per_batch: 3000
+      redist_allow_excess_destinations: true
+      redist_max_excess_per_voxel: 0.7
+      redist_excess_capacity_factor: 0.5
 
 output:
   filename: waam_results.txt

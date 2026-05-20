@@ -1,7 +1,6 @@
-# @package _global_
-#
 # WAAM dataset config for LeWM training.
 #
+# Keys are nested under "data" (default package for config-group data/*.yaml).
 # Render params: mirror of conf/training/default.yaml.
 # Canonical source: conf/training/default.yaml — update both if defaults change.
 #
@@ -11,7 +10,7 @@
 dataset:
   type: waam
   path: ???                  # e.g. output/datagen/randlines_20260508_132331.h5
-  frameskip: 1
+  frameskip: 4
   num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
   observation_source: raw    # render from slabs ("auto" | "raw" | "pixels")
   keys_to_load:
@@ -20,6 +19,10 @@ dataset:
     - position_xy_mm
     - ir
     - depth
+    # Material and temperature raw slabs — required when probe.enabled = true
+    # to compute peak_temp_k and pct_geometry probe targets.
+    - material
+    - temperature
 
 render:
   projection_mode: 0

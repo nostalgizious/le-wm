@@ -13,6 +13,7 @@ from omegaconf import OmegaConf, open_dict
 from jepa import JEPA
 from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+from probe_callback import ProbeValidationCallback
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -55,8 +56,8 @@ def run(cfg):
         from src.dataloader.waam_dataset import WaamFlatDataset
 
         render_overrides = (
-            OmegaConf.to_container(cfg.render, resolve=True)
-            if hasattr(cfg, "render") else None
+            OmegaConf.to_container(cfg.data.render, resolve=True)
+            if "render" in cfg.data else None
         )
 
         dataset = WaamFlatDataset(
@@ -66,6 +67,7 @@ def run(cfg):
             keys_to_load=cfg.data.dataset.keys_to_load,
             render_overrides=render_overrides,
             observation_source=cfg.data.dataset.get("observation_source", "auto"),
+            return_raw=OmegaConf.select(cfg, "probe.enabled", default=False),
         )
     else:
         dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
@@ -74,6 +76,10 @@ def run(cfg):
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
+                continue
+            # Raw slabs are consumed by WaamDerivedTargets before normalization;
+            # they are 4D [N, Z, Y, X] and cannot be normalization-collapsed.
+            if col in ("material", "temperature"):
                 continue
 
             normalizer = get_column_normalizer(dataset, col, col)
@@ -91,6 +97,19 @@ def run(cfg):
 
     train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
     val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
+
+    # ── Probe precondition check ─────────────────────────────────────
+    if OmegaConf.select(cfg, "probe.enabled"):
+        available = set(dataset.column_names)
+        missing_raw = {"material", "temperature"} - available
+        if missing_raw:
+            msg = (
+                f"probe.enabled=true but the HDF5 dataset does not contain raw "
+                f"material/temperature slabs ({sorted(missing_raw)} not in {sorted(available)}).\n"
+                f"The dataset was generated with store_raw=False.\n"
+                f"Re-run datagen with store_raw=True, or set probe.enabled=false."
+            )
+            raise RuntimeError(msg)
     
     ##############################
     ##       model / optim      ##
@@ -106,7 +125,7 @@ def run(cfg):
 
     hidden_dim = encoder.config.hidden_size
     embed_dim = cfg.wm.get("embed_dim", hidden_dim)
-    effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
+    effective_act_dim = dataset.get_dim("action")
 
     predictor = ARPredictor(
         num_frames=cfg.wm.history_size,
@@ -177,10 +196,29 @@ def run(cfg):
         dirpath=run_dir, filename=cfg.output_model_name, epoch_interval=1,
     )
 
+    # ── Probe validation callback (opt-in) ──────────────────────────────
+    extra_callbacks = [object_dump_callback]
+    if OmegaConf.select(cfg, "probe.enabled"):
+        # Build h5_attrs for on-the-fly derived target computation
+        h5_attrs = getattr(dataset, "probe_h5_attrs", None)
+        probe_cb = ProbeValidationCallback(
+            embed_dim=cfg.wm.embed_dim,
+            target_specs={
+                "position_xy_mm": 2,
+                "peak_temp_k": 1,
+                "pct_geometry": 1,
+            },
+            mlp_fit_epochs=cfg.probe.mlp_fit.epochs,
+            mlp_fit_lr=cfg.probe.mlp_fit.lr,
+            mlp_fit_batch_size=cfg.probe.mlp_fit.batch_size,
+            h5_attrs=h5_attrs,
+        )
+        extra_callbacks.append(probe_cb)
+
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[object_dump_callback],
-        num_sanity_val_steps=1,
+        callbacks=extra_callbacks,
+        num_sanity_val_steps=0 if OmegaConf.select(cfg, "probe.enabled") else 1,
         logger=logger,
         enable_checkpointing=True,
     )
