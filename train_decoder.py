@@ -67,6 +67,7 @@ def train_decoder(
     lr=1e-3,
     batch_size=64,
     val_split=0.1,
+    logger=None,
 ):
     """Train the decoder on extracted CLS-pixel pairs.
 
@@ -78,10 +79,13 @@ def train_decoder(
         lr: Learning rate.
         batch_size: Training batch size.
         val_split: Fraction of data for validation.
+        logger: Optional W&B logger for metric logging.
 
     Returns:
         Dict with ``train_losses`` and ``val_losses`` per epoch.
     """
+    import wandb
+
     N = cls_tokens.size(0)
     n_val = max(int(N * val_split), 4)
     n_train = N - n_val
@@ -111,13 +115,39 @@ def train_decoder(
             optimizer.step()
             epoch_loss += loss.item() * len(idx)
         scheduler.step()
-        train_losses.append(epoch_loss / n_train)
+        avg_train = epoch_loss / n_train
+        train_losses.append(avg_train)
 
         decoder.eval()
         with torch.inference_mode():
             val_preds = decoder(val_cls)
             val_loss = float(F.mse_loss(val_preds, val_pix))
             val_losses.append(val_loss)
+
+        # Log to W&B if available
+        if wandb.run is not None:
+            wandb.log({
+                "decoder/train_mse": avg_train,
+                "decoder/val_mse": val_loss,
+                "decoder/epoch": epoch,
+                "decoder/lr": scheduler.get_last_lr()[0],
+            })
+
+        if epoch % 10 == 0 or epoch == epochs - 1:
+            tqdm_str = f"epoch {epoch+1:3d}/{epochs}  train_mse={avg_train:.6f}  val_mse={val_loss:.6f}"
+            if wandb.run is not None:
+                # Log sample reconstructions every 10 epochs
+                with torch.inference_mode():
+                    sample_cls = val_cls[:4]
+                    sample_pix = val_pix[:4]
+                    sample_recon = decoder(sample_cls)
+                    wandb.log({
+                        "decoder/reconstructions": [
+                            wandb.Image(img, caption=f"sample_{i}")
+                            for i, img in enumerate(sample_recon)
+                        ],
+                    }, commit=False)
+            print(tqdm_str)
 
     return {"train_losses": train_losses, "val_losses": val_losses}
 
@@ -181,6 +211,17 @@ def run(cfg):
     ).to(cls_tokens.device)
 
     dc_cfg = cfg.get("decoder", {})
+    # Init W&B if enabled in config
+    use_wandb = OmegaConf.select(cfg, "wandb.enabled", default=False)
+    if use_wandb:
+        import wandb
+        wandb.init(
+            project=OmegaConf.select(cfg, "wandb.config.project", default="lwm-waam"),
+            entity=OmegaConf.select(cfg, "wandb.config.entity", default="fsandco"),
+            name=(OmegaConf.select(cfg, "wandb.config.name", default="decoder") + "_decoder"),
+            config=OmegaConf.to_container(cfg, resolve=True),
+            reinit=True,
+        )
     results = train_decoder(
         decoder,
         cls_tokens,
@@ -190,6 +231,8 @@ def run(cfg):
         batch_size=dc_cfg.get("batch_size", 64),
         val_split=dc_cfg.get("val_split", 0.1),
     )
+    if use_wandb:
+        wandb.finish()
 
     print(f"Final train MSE: {results['train_losses'][-1]:.6f}")
     print(f"Final val MSE: {results['val_losses'][-1]:.6f}")
