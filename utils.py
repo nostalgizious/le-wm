@@ -4,11 +4,29 @@ from pathlib import Path
 from stable_pretraining import data as dt
 from lightning.pytorch.callbacks import Callback
 
-def get_img_preprocessor(source: str, target: str, img_size: int = 224):
-    imagenet_stats = dt.dataset_stats.ImageNet
-    to_image = dt.transforms.ToImage(**imagenet_stats, source=source, target=target)
+def get_img_preprocessor(source: str, target: str, img_size: int = 224, normalize: bool = True):
+    """Image preprocessor that handles numpy (T, C, H, W) correctly.
+
+    ``ToImage`` assumes numpy arrays are in (…, H, W, C) layout and does
+    ``transpose(-3, -1)``.  WAAM datasets return (T, C, H, W) numpy
+    (channels-first) so the transpose corrupts the channel dimension.
+    We convert numpy → torch first so the tensor fast-path is used.
+    """
+    stats = dt.dataset_stats.ImageNet if normalize else {"mean": [0.0, 0.0, 0.0], "std": [1.0, 1.0, 1.0]}
+
+    def _ensure_tensor(x):
+        if isinstance(x, np.ndarray):
+            return torch.from_numpy(x)
+        return x
+
+    to_tensor = dt.transforms.WrapTorchTransform(
+        _ensure_tensor, source=source, target=target
+    )
+    to_image = dt.transforms.ToImage(
+        **stats, source=source, target=target
+    )
     resize = dt.transforms.Resize(img_size, source=source, target=target)
-    return dt.transforms.Compose(to_image, resize)
+    return dt.transforms.Compose(to_tensor, to_image, resize)
 
 
 def get_column_normalizer(dataset, source: str, target: str):
@@ -20,7 +38,11 @@ def get_column_normalizer(dataset, source: str, target: str):
     std = data.std(0, keepdim=True).clone()
 
     def norm_fn(x):
-        return ((x - mean) / std).float()
+        if not torch.is_tensor(x):
+            x = torch.from_numpy(np.asarray(x))
+        m = mean.to(device=x.device, dtype=x.dtype)
+        s = std.to(device=x.device, dtype=x.dtype)
+        return ((x - m) / s).float()
 
     normalizer = dt.transforms.WrapTorchTransform(norm_fn, source=source, target=target)
     return normalizer

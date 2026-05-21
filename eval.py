@@ -19,7 +19,7 @@ def img_transform(cfg):
         [
             transforms.ToImage(),
             transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize(**spt.data.dataset_stats.ImageNet),
+            transforms.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0]),
             transforms.Resize(size=cfg.eval.img_size),
         ]
     )
@@ -39,23 +39,49 @@ def get_episodes_length(dataset, episodes):
 
 def get_dataset(cfg, dataset_name):
     dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
-    dataset = swm.data.HDF5Dataset(
-        dataset_name,
-        keys_to_cache=cfg.dataset.keys_to_cache,
-        cache_dir=dataset_path,
-    )
+
+    # If a direct .h5 path is given, use the WAAM dataset loader which
+    # handles the datagen HDF5 format (episodes/<id>/<column>).
+    name_str = str(dataset_name)
+    if name_str.endswith(".h5"):
+        h5_path = Path(name_str)
+        if not h5_path.is_absolute():
+            h5_path = dataset_path / h5_path
+        from src.dataloader.waam_dataset import WaamFlatDataset
+        dataset = WaamFlatDataset(
+            name=h5_path.stem,
+            cache_dir=str(h5_path.parent),
+            keys_to_cache=cfg.dataset.keys_to_cache,
+        )
+    else:
+        dataset = swm.data.HDF5Dataset(
+            dataset_name,
+            keys_to_cache=cfg.dataset.keys_to_cache,
+            cache_dir=dataset_path,
+        )
     return dataset
 
-@hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
+@hydra.main(version_base=None, config_path="./config/eval", config_name="waam")
 def run(cfg: DictConfig):
     """Run evaluation of dinowm vs random policy."""
     assert (
         cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
     ), "Planning horizon must be smaller than or equal to eval_budget"
 
+    # ── WAAM integration: resolve env config + render overrides ──
+    import src.environment.register  # noqa: F401  — triggers gym registration
+
+    waam_cfg_dict = OmegaConf.to_container(cfg.waam, resolve=True)
+    overrides_dict = OmegaConf.to_container(cfg.planning_render_overrides, resolve=True)
+
     # create world environment
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
-    world = swm.World(**cfg.world, image_shape=(224, 224))
+    world = swm.World(
+        **cfg.world,
+        image_shape=(cfg.eval.img_size, cfg.eval.img_size),
+        waam_cfg=waam_cfg_dict,
+        render_overrides=overrides_dict,
+    )
 
     # create the transform
     transform = {
@@ -72,8 +98,11 @@ def run(cfg: DictConfig):
     for col in cfg.dataset.keys_to_cache:
         if col in ["pixels"]:
             continue
-        processor = preprocessing.StandardScaler()
         col_data = stats_dataset.get_col_data(col)
+        # Skip multi-dimensional columns (geom_map, goal_geometry, etc.)
+        if col_data.ndim > 2:
+            continue
+        processor = preprocessing.StandardScaler()
         col_data = col_data[~np.isnan(col_data).any(axis=1)]
         processor.fit(col_data)
         process[col] = processor
@@ -139,18 +168,40 @@ def run(cfg: DictConfig):
     world.set_policy(policy)
 
     start_time = time.time()
-    metrics = world.evaluate_from_dataset(
+    metrics = world._evaluate_from_dataset(
         dataset,
         start_steps=eval_start_idx.tolist(),
-        goal_offset_steps=cfg.eval.goal_offset_steps,
+        goal_offset=cfg.eval.goal_offset_steps,
         eval_budget=cfg.eval.eval_budget,
         episodes_idx=eval_episodes.tolist(),
         callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
-        video_path=results_path,
+        video=None,
+        mode="auto",
     )
     end_time = time.time()
     
     print(metrics)
+
+    # ── Log CEM metrics to W&B if enabled ──
+    if OmegaConf.select(cfg, "wandb.enabled"):
+        try:
+            import wandb
+            wandb.init(
+                project=OmegaConf.select(cfg, "wandb.config.project") or "lwm-waam",
+                entity=OmegaConf.select(cfg, "wandb.config.entity") or "fsandco",
+                name=(OmegaConf.select(cfg, "wandb.config.name") or "waam_eval"),
+                config=OmegaConf.to_container(cfg, resolve=True),
+                reinit=True,
+            )
+            wandb.log({
+                "eval/success_rate": float(metrics.get("success_rate", 0)),
+                "eval/evaluation_time_s": end_time - start_time,
+                "eval/num_eval": int(cfg.eval.num_eval),
+                "eval/goal_offset": int(cfg.eval.goal_offset_steps),
+            })
+            wandb.finish()
+        except Exception:
+            pass  # W&B logging is best-effort; don't fail eval if it errors
 
     results_path = results_path / cfg.output.filename
     results_path.parent.mkdir(parents=True, exist_ok=True)
