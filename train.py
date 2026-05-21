@@ -79,7 +79,8 @@ def run(cfg):
                 continue
             # Raw slabs are consumed by WaamDerivedTargets before normalization;
             # they are 4D [N, Z, Y, X] and cannot be normalization-collapsed.
-            if col in ("material", "temperature"):
+            # ir/depth are render intermediates, not model inputs — skip them.
+            if col in ("material", "temperature", "ir", "depth"):
                 continue
 
             normalizer = get_column_normalizer(dataset, col, col)
