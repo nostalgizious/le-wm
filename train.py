@@ -71,7 +71,7 @@ def run(cfg):
         )
     else:
         dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
-    transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size, normalize=False)]
+    transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
     
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
@@ -79,8 +79,7 @@ def run(cfg):
                 continue
             # Raw slabs are consumed by WaamDerivedTargets before normalization;
             # they are 4D [N, Z, Y, X] and cannot be normalization-collapsed.
-            # ir/depth are render intermediates, not model inputs — skip them.
-            if col in ("material", "temperature", "ir", "depth"):
+            if col in ("material", "temperature"):
                 continue
 
             normalizer = get_column_normalizer(dataset, col, col)

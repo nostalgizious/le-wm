@@ -252,26 +252,6 @@ class ProbeValidationCallback(pl.Callback):
         self.linear_probes.to(device)
         self.mlp_probes.to(device)
 
-        # Align all targets to the same row count as embeddings.
-        # Should always be identical; truncation here catches
-        # accumulation mismatches with a warning rather than a crash.
-        n_emb = all_emb.size(0)
-        aligned_targets: dict[str, torch.Tensor] = {}
-        for name, y in all_targets.items():
-            if y.size(0) != n_emb:
-                import warnings
-                warnings.warn(
-                    f"emb/target row-count mismatch for '{name}': "
-                    f"all_emb={n_emb}, {name}={y.size(0)}. Truncating.",
-                    stacklevel=2,
-                )
-                aligned_targets[name] = y[:n_emb] if y.size(0) > n_emb else torch.cat([
-                    y, torch.zeros(n_emb - y.size(0), y.size(1), device=device, dtype=y.dtype)
-                ])
-            else:
-                aligned_targets[name] = y
-        all_targets = aligned_targets
-
         for name, target_dim in self._target_specs.items():
             if name not in all_targets:
                 continue

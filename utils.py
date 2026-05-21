@@ -4,7 +4,7 @@ from pathlib import Path
 from stable_pretraining import data as dt
 from lightning.pytorch.callbacks import Callback
 
-def get_img_preprocessor(source: str, target: str, img_size: int = 224, normalize: bool = True):
+def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     """Image preprocessor that handles numpy (T, C, H, W) correctly.
 
     ``ToImage`` assumes numpy arrays are in (…, H, W, C) layout and does
@@ -12,7 +12,7 @@ def get_img_preprocessor(source: str, target: str, img_size: int = 224, normaliz
     (channels-first) so the transpose corrupts the channel dimension.
     We convert numpy → torch first so the tensor fast-path is used.
     """
-    stats = dt.dataset_stats.ImageNet if normalize else {"mean": [0.0, 0.0, 0.0], "std": [1.0, 1.0, 1.0]}
+    imagenet_stats = dt.dataset_stats.ImageNet
 
     def _ensure_tensor(x):
         if isinstance(x, np.ndarray):
@@ -23,7 +23,7 @@ def get_img_preprocessor(source: str, target: str, img_size: int = 224, normaliz
         _ensure_tensor, source=source, target=target
     )
     to_image = dt.transforms.ToImage(
-        **stats, source=source, target=target
+        **imagenet_stats, source=source, target=target
     )
     resize = dt.transforms.Resize(img_size, source=source, target=target)
     return dt.transforms.Compose(to_tensor, to_image, resize)

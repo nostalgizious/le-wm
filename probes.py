@@ -193,14 +193,10 @@ def fit_linear_lstsq(
     # Add bias column
     X_aug = torch.cat([X, torch.ones(X.size(0), 1, device=device)], dim=1)
 
-    if X_aug.size(0) != y.size(0):
-        n = min(X_aug.size(0), y.size(0))
-        X_aug = X_aug[:n]
-        y = y[:n]
-
     try:
         solution = torch.linalg.lstsq(X_aug, y).solution  # [embed_dim+1, target_dim]
     except RuntimeError:
+        # Rank-deficient fallback
         solution = torch.linalg.pinv(X_aug) @ y
 
     if not torch.isfinite(solution).all():
@@ -208,13 +204,6 @@ def fit_linear_lstsq(
 
     weight = solution[:-1, :].T  # [target_dim, embed_dim]
     bias = solution[-1, :]       # [target_dim]
-
-    # Guard against shape mismatch: clip weight to probe's expected shape
-    expected_weight = probe.linear.weight.shape
-    if weight.shape != expected_weight:
-        w_dst, h_dst = expected_weight
-        weight = weight[:w_dst, :h_dst]
-        bias = bias[:w_dst]
 
     probe.linear.weight.copy_(weight.to(probe.linear.weight.dtype))
     probe.linear.bias.copy_(bias.to(probe.linear.bias.dtype))

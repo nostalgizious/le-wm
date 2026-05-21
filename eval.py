@@ -19,7 +19,7 @@ def img_transform(cfg):
         [
             transforms.ToImage(),
             transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0]),
+            transforms.Normalize(**spt.data.dataset_stats.ImageNet),
             transforms.Resize(size=cfg.eval.img_size),
         ]
     )
