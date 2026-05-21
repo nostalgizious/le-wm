@@ -129,9 +129,21 @@ def run(cfg):
 
     print("Loading checkpoint...")
     ckpt_path = Path(cfg.get("ckpt", "")).expanduser()
-    if not ckpt_path.suffix:
-        ckpt_path = ckpt_path / "weights.pt"
-    model = swm.utils.load_pretrained(str(ckpt_path.parent) if ckpt_path.suffix == ".pt" else str(ckpt_path))
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    # Load the model: .ckpt files are full torch.save(model) checkpoints;
+    # folders are load_pretrained-compatible (weights.pt + config.json).
+    if ckpt_path.is_file():
+        loaded = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        # _object.ckpt is a spt.Module wrapping JEPA; extract the .model
+        model = loaded.model if hasattr(loaded, "model") else loaded
+    else:
+        if not ckpt_path.suffix:
+            ckpt_path = ckpt_path / "weights.pt"
+        model = swm.utils.load_pretrained(
+            str(ckpt_path.parent) if ckpt_path.suffix == ".pt" else str(ckpt_path)
+        )
     model = model.to(cfg.get("device", "cuda"))
     model.eval()
 
