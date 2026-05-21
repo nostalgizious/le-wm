@@ -201,6 +201,19 @@ def run(cfg):
     if OmegaConf.select(cfg, "probe.enabled"):
         # Build h5_attrs for on-the-fly derived target computation
         h5_attrs = getattr(dataset, "probe_h5_attrs", None)
+        # Auto-discover decoder weights if decoder was trained
+        decoder_ckpt = None
+        decoder_dir = OmegaConf.select(cfg, "probe.decoder_ckpt_path")
+        if decoder_dir is not None:
+            decoder_ckpt = str(Path(decoder_dir).expanduser())
+        else:
+            # Check subdir (Hydra output) and current working dir
+            subdir = cfg.get("subdir") or "."
+            for search in [Path(subdir), Path(".")]:
+                candidate = search / "decoder_weights.pt"
+                if candidate.exists():
+                    decoder_ckpt = str(candidate.resolve())
+                    break
         probe_cb = ProbeValidationCallback(
             embed_dim=cfg.wm.embed_dim,
             target_specs={
@@ -212,6 +225,7 @@ def run(cfg):
             mlp_fit_lr=cfg.probe.mlp_fit.lr,
             mlp_fit_batch_size=cfg.probe.mlp_fit.batch_size,
             h5_attrs=h5_attrs,
+            decoder_ckpt_path=decoder_ckpt,
         )
         extra_callbacks.append(probe_cb)
 
