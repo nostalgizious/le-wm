@@ -186,7 +186,7 @@ def run(cfg):
         dataset = WaamFlatDataset(
             path=str(data_path.expanduser().resolve()),
             frameskip=cfg.data.dataset.get("frameskip", 1),
-            num_steps=cfg.data.dataset.get("num_steps", 1),
+            num_steps=1,  # only need first timestep for decoder training
             keys_to_load=["pixels"],
         )
     else:
