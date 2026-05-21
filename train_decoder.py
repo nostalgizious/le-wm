@@ -41,14 +41,16 @@ def extract_cls_pixel_pairs(model, dataset, device="cpu", batch_size=128):
     all_pixels = []
     with torch.inference_mode():
         for batch in loader:
-            pixels = batch["pixels"].to(device)
-            B, T = pixels.shape[:2]
-            batch["pixels"] = pixels
-            info = model.encode(batch)
+            # encode() expects only 'pixels'; strip any keys loaded by
+            # the dataset provider (e.g. 'action', 'position_xy_mm')
+            # that are not needed for CLS extraction.
+            info = {"pixels": batch["pixels"].to(device)}
+            info = model.encode(info)
             emb = info["emb"]
             cls = emb[:, 0, :].cpu()
             all_cls.append(cls)
-            img = pixels[:, 0, ...].cpu()
+            # Store the corresponding pixel image (first timestep)
+            img = batch["pixels"][:, 0, ...].cpu()
             all_pixels.append(img)
 
     return torch.cat(all_cls, dim=0), torch.cat(all_pixels, dim=0)
