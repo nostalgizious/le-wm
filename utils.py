@@ -96,12 +96,15 @@ def _compute_all_norm_stats(dataset) -> dict[str, dict[str, list[float]]]:
         dataset, batch_size=256, shuffle=False, num_workers=n_workers,
     )
 
+    # Only need a small sample for stable mean/std — bounded physical quantities.
+    max_batches = min(100, total_batches)
+
     accum: dict[str, dict] = {col: {"total": None, "total_sq": None, "count": 0}
                               for col in columns}
     total_batches = len(loader)
 
     for i, batch in enumerate(loader):
-        if i % max(1, total_batches // 10) == 0:
+        if i % max(1, min(max_batches, total_batches) // 10) == 0:
             print(f"    batch {i+1:4d}/{total_batches}  "
                   f"({100*(i+1)//total_batches:3d}%)", flush=True)
 
@@ -128,6 +131,10 @@ def _compute_all_norm_stats(dataset) -> dict[str, dict[str, list[float]]]:
                 a["total"] += data.sum(dim=0)
                 a["total_sq"] += (data * data).sum(dim=0)
             a["count"] += n
+
+        if i >= max_batches - 1:
+            print(f"    (sampled {max_batches}/{total_batches} batches)", flush=True)
+            break
 
     result = {}
     for col in columns:
