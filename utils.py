@@ -105,12 +105,12 @@ def _compute_all_norm_stats(dataset) -> dict[str, dict[str, list[float]]]:
     total_batches = len(loader)
 
     # Only need a small sample for stable mean/std — bounded physical quantities.
-    max_batches = min(20, total_batches)
+    max_batches = min(24, total_batches)
 
     for i, batch in enumerate(loader):
-        if i % max(1, min(max_batches, total_batches) // 10) == 0:
-            print(f"    batch {i+1:4d}/{total_batches}  "
-                  f"({100*(i+1)//total_batches:3d}%)", flush=True)
+        if i % max(1, max_batches // 5) == 0:
+            print(f"    batch {i+1:4d}/{max_batches}  "
+                  f"({100*(i+1)//max_batches:3d}%)", flush=True)
 
         for col in columns:
             data = batch.get(col)
