@@ -12,7 +12,8 @@ dataset:
   path: ???                  # e.g. output/datagen/randlines_20260508_132331.h5
   frameskip: 4
   num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
-  observation_source: raw    # render from slabs ("auto" | "raw" | "pixels")
+  observation_source: auto    # render from slabs ("auto" | "raw" | "pixels")
+  max_episodes: null          # limit to first N episodes; null = all
   keys_to_load:
     - pixels
     - action

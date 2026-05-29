@@ -3,7 +3,6 @@ import json
 import os
 from pathlib import Path
 
-import h5py
 import numpy as np
 import torch
 from stable_pretraining import data as dt
@@ -42,27 +41,32 @@ _NORM_CACHE: dict[str, dict] = {}
 """h5_path → {col: {mean: [...], std: [...]}}  (in-memory cache)"""
 
 
+def _cached_stats_path(h5_path: str) -> str:
+    """Sidecar path for normalization cache — avoids HDF5 file-locking issues."""
+    return h5_path + ".norm_stats.json"
+
+
 def _read_cached_norm_stats(h5_path: str) -> dict | None:
     """Return cached per-column normalization stats, or None if invalid/missing."""
     code_hash = _compute_norm_code_hash()
+    cache_path = _cached_stats_path(h5_path)
     try:
-        with h5py.File(h5_path, "r", libver="latest") as f:
-            if f.attrs.get("norm_stats_code_hash") != code_hash:
-                return None
-            raw = f.attrs.get("norm_stats_json")
-            if raw is None:
-                return None
-        return json.loads(raw)
-    except Exception:
+        with open(cache_path, "r") as fh:
+            data = json.load(fh)
+        if data.get("_code_hash") != code_hash:
+            return None
+        return data.get("stats")
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
         return None
 
 
 def _write_cached_norm_stats(h5_path: str, stats: dict) -> None:
-    """Write per-column normalization stats as HDF5 root attributes."""
+    """Write per-column normalization stats as a JSON sidecar file."""
     code_hash = _compute_norm_code_hash()
-    with h5py.File(h5_path, "r+", libver="latest") as f:
-        f.attrs["norm_stats_code_hash"] = code_hash
-        f.attrs["norm_stats_json"] = json.dumps(stats)
+    cache_path = _cached_stats_path(h5_path)
+    payload = {"_code_hash": code_hash, "stats": stats}
+    with open(cache_path, "w") as fh:
+        json.dump(payload, fh)
 
 
 def _compute_all_norm_stats(dataset) -> dict[str, dict[str, list[float]]]:
@@ -226,10 +230,9 @@ def get_column_normalizer(dataset, source: str, target: str):
     print(f"  ⚡ Computing & caching normalization stats → {h5_path}", flush=True)
     stats = _compute_all_norm_stats(dataset)
     _NORM_CACHE[h5_path] = stats
-    dataset.close()  # release read handles so r+ can open
     try:
         _write_cached_norm_stats(h5_path, stats)
-        print(f"  ✓ Cached normalization stats to HDF5 root attrs", flush=True)
+        print(f"  ✓ Cached normalization stats → {_cached_stats_path(h5_path)}", flush=True)
     except Exception as exc:
         print(f"  ⚠  Could not write norm cache ({exc})", flush=True)
 

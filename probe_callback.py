@@ -300,7 +300,7 @@ class ProbeValidationCallback(pl.Callback):
             n = min(self._n_decode, emb_cat.size(0))
 
             with torch.inference_mode():
-                recons = self._decoder(emb_cat[:n]).cpu()
+                recons = self._decoder(emb_cat[:n].float()).cpu()
 
             # Log original + reconstructed image grids via W&B
             for logger in trainer.loggers:
