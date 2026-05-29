@@ -191,7 +191,7 @@ def get_column_normalizer(dataset, source: str, target: str):
     Invalidation: stats are recomputed when ``utils.py`` changes (SHA256
     hash of this file).
     """
-    if source in ("pixels", "material", "temperature"):
+    if source in ("pixels", "material", "temperature", "ir", "depth"):
         def _id(x):
             if not torch.is_tensor(x):
                 x = torch.from_numpy(np.asarray(x))
@@ -208,10 +208,7 @@ def get_column_normalizer(dataset, source: str, target: str):
         cached = _NORM_CACHE[h5_path]
         if source in cached:
             s = cached[source]
-            print(f"  ✓ Using in-memory norm cache for {source}", flush=True)
             return _make_normalizer(s["mean"], s["std"], source, target)
-        else:
-            print(f"  ⚠  In-memory cache hit but {source} missing, keys={list(cached.keys())}", flush=True)
 
     if h5_path is None:
         # Fallback: compute without caching
