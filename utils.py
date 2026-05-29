@@ -96,12 +96,12 @@ def _compute_all_norm_stats(dataset) -> dict[str, dict[str, list[float]]]:
         dataset, batch_size=256, shuffle=False, num_workers=n_workers,
     )
 
-    # Only need a small sample for stable mean/std — bounded physical quantities.
-    max_batches = min(100, total_batches)
-
     accum: dict[str, dict] = {col: {"total": None, "total_sq": None, "count": 0}
                               for col in columns}
     total_batches = len(loader)
+
+    # Only need a small sample for stable mean/std — bounded physical quantities.
+    max_batches = min(100, total_batches)
 
     for i, batch in enumerate(loader):
         if i % max(1, min(max_batches, total_batches) // 10) == 0:
