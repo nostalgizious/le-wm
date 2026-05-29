@@ -38,6 +38,10 @@ def _compute_norm_code_hash() -> str:
     return h.hexdigest()[:16]
 
 
+_NORM_CACHE: dict[str, dict] = {}
+"""h5_path → {col: {mean: [...], std: [...]}}  (in-memory cache)"""
+
+
 def _read_cached_norm_stats(h5_path: str) -> dict | None:
     """Return cached per-column normalization stats, or None if invalid/missing."""
     code_hash = _compute_norm_code_hash()
@@ -194,28 +198,39 @@ def get_column_normalizer(dataset, source: str, target: str):
         return _make_normalizer([0.0], [1.0], source, target)
 
     h5_path = getattr(dataset, "path", None)
+
+    # ── Check in-memory cache (instant) ──
+    if h5_path is not None and h5_path in _NORM_CACHE:
+        cached = _NORM_CACHE[h5_path]
+        if source in cached:
+            s = cached[source]
+            return _make_normalizer(s["mean"], s["std"], source, target)
+
     if h5_path is None:
         # Fallback: compute without caching
         stats = _compute_all_norm_stats(dataset)
         if source in stats:
-            return _make_normalizer(stats[source]["mean"], stats[source]["std"],
-                                    source, target)
+            s = stats[source]
+            return _make_normalizer(s["mean"], s["std"], source, target)
         return _make_normalizer([0.0], [1.0], source, target)
 
-    # ── Try cached path ──
+    # ── Check HDF5 cache ──
     cached = _read_cached_norm_stats(h5_path)
-    if cached is not None and source in cached:
-        s = cached[source]
-        return _make_normalizer(s["mean"], s["std"], source, target)
+    if cached is not None:
+        _NORM_CACHE[h5_path] = cached  # promote to memory
+        if source in cached:
+            s = cached[source]
+            return _make_normalizer(s["mean"], s["std"], source, target)
 
-    # ── Compute all columns at once, cache, then return ──
-    print(f"  ⚡ Computing & caching normalization stats → {h5_path}")
+    # ── Compute all columns at once, cache in memory + on HDF5 ──
+    print(f"  ⚡ Computing & caching normalization stats → {h5_path}", flush=True)
     stats = _compute_all_norm_stats(dataset)
+    _NORM_CACHE[h5_path] = stats
     try:
         _write_cached_norm_stats(h5_path, stats)
-        print(f"  ✓ Cached normalization stats to HDF5 root attrs")
+        print(f"  ✓ Cached normalization stats to HDF5 root attrs", flush=True)
     except Exception as exc:
-        print(f"  ⚠  Could not write norm cache ({exc})")
+        print(f"  ⚠  Could not write norm cache ({exc})", flush=True)
 
     if source in stats:
         return _make_normalizer(stats[source]["mean"], stats[source]["std"],
