@@ -4,6 +4,7 @@ from pathlib import Path
 from stable_pretraining import data as dt
 from lightning.pytorch.callbacks import Callback
 
+
 def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     """Image preprocessor that handles numpy (T, C, H, W) correctly.
 
@@ -11,8 +12,10 @@ def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     ``transpose(-3, -1)``.  WAAM datasets return (T, C, H, W) numpy
     (channels-first) so the transpose corrupts the channel dimension.
     We convert numpy → torch first so the tensor fast-path is used.
+
+    No ImageNet normalization is applied — the ViT is randomly initialised
+    and pixels stay in [0, 1].
     """
-    imagenet_stats = dt.dataset_stats.ImageNet
 
     def _ensure_tensor(x):
         if isinstance(x, np.ndarray):
@@ -22,20 +25,67 @@ def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     to_tensor = dt.transforms.WrapTorchTransform(
         _ensure_tensor, source=source, target=target
     )
-    to_image = dt.transforms.ToImage(
-        **imagenet_stats, source=source, target=target
-    )
     resize = dt.transforms.Resize(img_size, source=source, target=target)
-    return dt.transforms.Compose(to_tensor, to_image, resize)
+    return dt.transforms.Compose(to_tensor, resize)
 
 
 def get_column_normalizer(dataset, source: str, target: str):
-    """Get normalizer for a specific column in the dataset."""
-    col_data = dataset.get_col_data(source)
-    data = torch.from_numpy(np.array(col_data))
-    data = data[~torch.isnan(data).any(dim=1)]
-    mean = data.mean(0, keepdim=True).clone()
-    std = data.std(0, keepdim=True).clone()
+    """Compute per-channel mean/std in a single streaming pass.
+
+    Uses the DataLoader to read batches (O(1) memory, no
+    ``get_col_data`` materialization).  Accumulates sum and sum-of-squares
+    in ``float64`` for numerical stability, then derives mean/std.
+    """
+    if len(dataset.lengths) == 0:
+        def _id(x):
+            if not torch.is_tensor(x):
+                x = torch.from_numpy(np.asarray(x))
+            return x.float()
+        return dt.transforms.WrapTorchTransform(_id, source=source, target=target)
+
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=64, shuffle=False, num_workers=0,
+    )
+
+    count = 0
+    total = None
+    total_sq = None
+
+    for batch in loader:
+        data = batch.get(source)
+        if data is None:
+            continue
+        if isinstance(data, np.ndarray):
+            data = torch.from_numpy(data)
+
+        # Flatten spatial dims, keep channel dim → [N_flat, D]
+        D = data.shape[-1] if data.dim() > 0 else 1
+        data = data.reshape(-1, D).to(dtype=torch.float64)
+
+        valid = ~torch.isnan(data).any(dim=1)
+        data = data[valid]
+        n = data.shape[0]
+        if n == 0:
+            continue
+
+        if total is None:
+            total = data.sum(dim=0)
+            total_sq = (data * data).sum(dim=0)
+        else:
+            total += data.sum(dim=0)
+            total_sq += (data * data).sum(dim=0)
+        count += n
+
+    if total is None or count < 2:
+        mean = torch.zeros(1)
+        std = torch.ones(1)
+    else:
+        mean = (total / count).to(dtype=torch.float32).reshape(1, -1)
+        # E[X^2] - E[X]^2  → population variance, Bessel-corrected to sample variance
+        pop_var = (total_sq / count) - (mean.to(dtype=torch.float64).reshape(-1)) ** 2
+        pop_var = pop_var.clamp(min=0.0)
+        sample_var = pop_var * count / (count - 1)
+        std = sample_var.sqrt().to(dtype=torch.float32).reshape(1, -1)
 
     def norm_fn(x):
         if not torch.is_tensor(x):
@@ -44,8 +94,7 @@ def get_column_normalizer(dataset, source: str, target: str):
         s = std.to(device=x.device, dtype=x.dtype)
         return ((x - m) / s).float()
 
-    normalizer = dt.transforms.WrapTorchTransform(norm_fn, source=source, target=target)
-    return normalizer
+    return dt.transforms.WrapTorchTransform(norm_fn, source=source, target=target)
 
 class ModelObjectCallBack(Callback):
     """Callback to pickle model object after each epoch."""
