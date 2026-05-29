@@ -88,7 +88,10 @@ def _compute_all_norm_stats(dataset) -> dict[str, dict[str, list[float]]]:
 
     print(f"  Computing normalization stats for: {columns}", flush=True)
 
-    n_workers = 0  # single-threaded: h5py handles + fork are unsafe
+    # Close any cached HDF5 handles so workers don't inherit them via fork.
+    dataset.close()
+
+    n_workers = min(8, max(1, os.cpu_count() or 1))
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=256, shuffle=False, num_workers=n_workers,
     )
