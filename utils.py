@@ -97,7 +97,7 @@ def _compute_all_norm_stats(dataset) -> dict[str, dict[str, list[float]]]:
 
     n_workers = min(8, max(1, os.cpu_count() or 1))
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=256, shuffle=False, num_workers=n_workers,
+        dataset, batch_size=256, shuffle=True, num_workers=n_workers,
     )
 
     accum: dict[str, dict] = {col: {"total": None, "total_sq": None, "count": 0}
@@ -105,7 +105,7 @@ def _compute_all_norm_stats(dataset) -> dict[str, dict[str, list[float]]]:
     total_batches = len(loader)
 
     # Only need a small sample for stable mean/std — bounded physical quantities.
-    max_batches = min(100, total_batches)
+    max_batches = min(20, total_batches)
 
     for i, batch in enumerate(loader):
         if i % max(1, min(max_batches, total_batches) // 10) == 0:
