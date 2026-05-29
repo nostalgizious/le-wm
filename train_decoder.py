@@ -23,35 +23,25 @@ from probes import VisualDecoder
 
 
 def extract_cls_pixel_pairs(model, dataset, device="cpu", batch_size=128):
-    """Extract (cls_token, pixels) pairs from a dataset.
-
-    Args:
-        model: LeWM model with ``encode(batch)`` method.
-        dataset: Dataset returning ``pixels`` key for CLS+image extraction.
-        device: Torch device.
-        batch_size: Extraction batch size.
-
-    Returns:
-        Tuple of ``(cls_tokens, pixel_images)`` tensors.
-    """
+    """Extract (cls_token, pixels) pairs from a dataset."""
     model.eval()
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     all_cls = []
     all_pixels = []
+    total = len(loader)
     with torch.inference_mode():
-        for batch in loader:
-            # encode() expects only 'pixels'; strip any keys loaded by
-            # the dataset provider (e.g. 'action', 'position_xy_mm')
-            # that are not needed for CLS extraction.
+        for i, batch in enumerate(loader):
             info = {"pixels": batch["pixels"].to(device)}
             info = model.encode(info)
             emb = info["emb"]
             cls = emb[:, 0, :].cpu()
             all_cls.append(cls)
-            # Store the corresponding pixel image (first timestep)
             img = batch["pixels"][:, 0, ...].cpu()
             all_pixels.append(img)
+
+            if i % 10 == 0 or i == total - 1:
+                print(f"  CLS extraction  batch {i+1}/{total}  ({100*(i+1)//total}%)")
 
     return torch.cat(all_cls, dim=0), torch.cat(all_pixels, dim=0)
 
@@ -70,6 +60,8 @@ def train_decoder(
 
     Logs train/val MSE and sample reconstructions to W&B if a run is active.
     """
+    device = next(decoder.parameters()).device
+
     N = cls_tokens.size(0)
     n_val = max(int(N * val_split), 4)
     n_train = N - n_val
@@ -77,8 +69,8 @@ def train_decoder(
     train_idx = perm[:n_train]
     val_idx = perm[n_train:]
 
-    train_cls, train_pix = cls_tokens[train_idx], pixel_images[train_idx]
-    val_cls, val_pix = cls_tokens[val_idx], pixel_images[val_idx]
+    train_cls, train_pix = cls_tokens[train_idx].to(device), pixel_images[train_idx]
+    val_cls, val_pix = cls_tokens[val_idx].to(device), pixel_images[val_idx].to(device)
 
     optimizer = torch.optim.AdamW(decoder.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -98,7 +90,7 @@ def train_decoder(
         for i in range(0, n_train, batch_size):
             idx = perm[i : i + batch_size]
             preds = decoder(train_cls[idx])
-            loss = F.mse_loss(preds, train_pix[idx])
+            loss = F.mse_loss(preds, train_pix[idx].to(device))
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -192,6 +184,11 @@ def main():
     cls_tokens, pixel_images = extract_cls_pixel_pairs(model, train_set, device=args.device)
     print(f"Extracted {cls_tokens.size(0)} pairs. CLS: {cls_tokens.shape}, Pixels: {pixel_images.shape}")
 
+    # ── Free JEPA model to make room for decoder on GPU ────────────────
+    model.cpu()
+    del model
+    torch.cuda.empty_cache()
+
     # ── Build decoder ────────────────────────────────────────────────
     decoder = VisualDecoder(
         embed_dim=args.embed_dim,
@@ -200,7 +197,7 @@ def main():
         depth=args.decoder_depth,
         heads=args.decoder_heads,
         dim_head=args.decoder_dim_head,
-    ).to(cls_tokens.device)
+    ).to(args.device)
 
     # ── W&B init ─────────────────────────────────────────────────────
     if args.wandb:
