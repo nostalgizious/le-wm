@@ -29,8 +29,43 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))          # for "from src.dataloader..."
 sys.path.insert(0, str(REPO_ROOT / "le-wm"))  # for "from probes...", "from jepa..."
 
-IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
-IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Action-normalizing cost model wrapper
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class NormalizedCostModel:
+    """Wraps a world model so that CEM/iCEM samples in normalized action space.
+
+    The model was trained on StandardScaler-normalized actions (zero mean,
+    unit variance), but the CEM solver naturally samples from N(0, 1).
+    This wrapper applies the same normalization inside ``get_cost`` and
+    exposes ``denormalize_actions`` for converting the solver's output back
+    to physical units before execution.
+    """
+
+    def __init__(self, model: torch.nn.Module, action_mean: torch.Tensor, action_std: torch.Tensor):
+        self._model = model
+        self.action_mean = action_mean
+        self.action_std = action_std
+
+    def parameters(self):
+        return self._model.parameters()
+
+    def get_cost(self, info_dict: dict, action_candidates: torch.Tensor) -> torch.Tensor:
+        """Normalize actions, then delegate to the real model."""
+        mean = self.action_mean.to(device=action_candidates.device, dtype=action_candidates.dtype)
+        std = self.action_std.to(device=action_candidates.device, dtype=action_candidates.dtype)
+        normalized = (action_candidates - mean) / std
+        return self._model.get_cost(info_dict, normalized)
+
+    def denormalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Convert normalized actions back to physical units."""
+        mean = self.action_mean.to(device=actions.device, dtype=actions.dtype)
+        std = self.action_std.to(device=actions.device, dtype=actions.dtype)
+        return actions * std + mean
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -39,7 +74,7 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
 
 
 class CaptureBestRollout:
-    """CEM callback that records the best action sequence per iteration."""
+    """iCEM callback that records the best action sequence per iteration."""
 
     def __init__(self):
         self.best_mean: torch.Tensor | None = None  # [B, horizon, action_dim]
@@ -61,23 +96,22 @@ class CaptureBestRollout:
         pass
 
     def __call__(self, **kwargs):
+        step = kwargs.get("step", 0)
         mean = kwargs["mean"]  # [B, horizon, action_dim] — current best mean
         topk_vals = kwargs["topk_vals"]  # [B, K]
         self.best_mean = mean.clone()
-        self.cost_history.append(float(topk_vals[:, 0].mean()))
+        best = float(topk_vals[:, 0].mean())  # mean of best elite cost across batch
+        topk_avg = float(topk_vals.mean())  # mean of all top-k costs
+        self.cost_history.append(best)
         self.mean_history.append(mean.clone())
+        if step % 5 == 0 or step == 0:
+            print(f"    iCEM iter {step:2d}: best={best:.2f}  topk_avg={topk_avg:.2f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Image helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-
-def unnormalize(img: torch.Tensor) -> torch.Tensor:
-    """Reverse ImageNet normalization → [0, 1]."""
-    mean = IMAGENET_MEAN.view(1, 3, 1, 1).to(img.device)
-    std = IMAGENET_STD.view(1, 3, 1, 1).to(img.device)
-    return (img * std + mean).clamp(0, 1)
 
 
 def _to_uint8(t: torch.Tensor, img_size: int = 128) -> np.ndarray:
@@ -141,7 +175,7 @@ def visualize_cem_rollout(
 ) -> Path | None:
     """Generate a 3-up MP4 with closed-loop MPC.
 
-    Each cycle: CEM plans ``horizon`` steps, the first ``receding_horizon`` are
+    Each cycle: iCEM plans ``horizon`` steps, the first ``receding_horizon`` are
     executed in the simulator and decoded from the model rollout.  The env state
     is then used as the starting point for the next cycle, up to ``total_steps``
     physical environment steps.
@@ -150,7 +184,7 @@ def visualize_cem_rollout(
     import gymnasium as gym
     from omegaconf import OmegaConf
     import stable_worldmodel as swm
-    from stable_worldmodel.solver.cem import CEMSolver
+    from stable_worldmodel.solver.icem import ICEMSolver
     from stable_worldmodel.policy import WorldModelPolicy
 
     from probes import VisualDecoder
@@ -200,6 +234,21 @@ def visualize_cem_rollout(
     ep_len = int(ds.lengths[episode_idx])
     if start_step >= ep_len:
         raise ValueError(f"start_step={start_step} >= episode length={ep_len}")
+
+    # ── Compute action normalizer stats (model was trained on normalized actions) ──
+    print("Computing action normalizer stats from dataset...")
+    action_data = torch.from_numpy(np.asarray(ds.get_col_data("action"), dtype=np.float32))
+    action_data = action_data[~torch.isnan(action_data).any(dim=1)]
+    action_mean = action_data.mean(0).to(device)
+    action_std = action_data.std(0).to(device)
+    action_std = action_std.clamp(min=1e-6)  # avoid division by zero
+    action_dim_per_step = action_mean.numel()
+    print(f"  action dim: {action_dim_per_step}, mean range: [{action_mean.min():.2f}, {action_mean.max():.2f}], "
+          f"std range: [{action_std.min():.4f}, {action_std.max():.4f}]")
+
+    # ── Wrap model with action normalization ────────────────────────────
+    wrapped_model = NormalizedCostModel(model, action_mean, action_std)
+    print(f"Model wrapped with action normalizer ({action_dim_per_step} dims).")
 
     # ── Read HDF5 rendering parameters (matches dataloader pipeline) ───
     import h5py as _h5py
@@ -350,18 +399,29 @@ def visualize_cem_rollout(
     )
     env.reset(seed=None, options={"_goal_spec": goal_spec})
 
-    # ── Build CEM solver with callback ────────────────────────────────
+    # ── Build iCEM solver with callback ────────────────────────────────
     plan_cfg = swm.PlanConfig(horizon=horizon, receding_horizon=receding_horizon,
                                action_block=4, history_len=3, warm_start=True)
     callback = CaptureBestRollout()
-    solver = CEMSolver(model=model, callbacks=[callback], device=device)
-    # CEM solver expects batched action space: shape (B, D).  Wrap the
-    # single-env action space (shape (D,)) to include a batch prefix.
+    solver = ICEMSolver(
+        model=wrapped_model, callbacks=[callback], device=device,
+        noise_beta=0.0,        # white noise (standard CEM) — avoids correlated "swirling"
+        num_samples=500,       # more samples for better exploration coverage
+        n_steps=30,            # default iterations
+        topk=50,               # slightly larger elite set
+        alpha=0.1,             # momentum (default)
+        n_elite_keep=5,        # elite injection (default)
+    )
+    # iCEM clamps candidates to action bounds.  Use normalized-space bounds
+    # (±5σ) so the solver explores broadly in the space the model expects.
+    # Denormalization back to physical units happens before env.step().
     from gymnasium.spaces import Box
-    raw_as = env.action_space
+    raw_as = env.action_space  # Box(shape=(3,), dtype=float32)
+    norm_low = np.full(raw_as.shape, -5.0, dtype=np.float32)
+    norm_high = np.full(raw_as.shape, 5.0, dtype=np.float32)
     batched_as = Box(
-        low=raw_as.low[np.newaxis, :],
-        high=raw_as.high[np.newaxis, :],
+        low=norm_low[np.newaxis, :],
+        high=norm_high[np.newaxis, :],
         shape=(1,) + raw_as.shape,
         dtype=raw_as.dtype,
     )
@@ -375,28 +435,12 @@ def visualize_cem_rollout(
             return v.float().unsqueeze(0).to(device)
         return torch.from_numpy(np.asarray(v)).float().unsqueeze(0).to(device)
 
-    def _env_pixels_to_input(env) -> torch.Tensor:
-        """Render env state with HDF5 params → ImageNet-normalised [1,1,3,H,W].
-        Matches the eval pipeline's transform for CEM solver input."""
-        render_out = _render_state_slab(env.state, xy_mm=env.curr_xy_mm)  # [H, W, 3] uint8
-        t = torch.from_numpy(render_out).float().permute(2, 0, 1).to(device) / 255.0
-        mean = IMAGENET_MEAN.to(device).view(3, 1, 1)
-        std = IMAGENET_STD.to(device).view(3, 1, 1)
-        t = (t - mean) / std
-        return t.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
-
     def _env_pixels_raw(env) -> torch.Tensor:
         """Render env state → raw [0,1] pixels [1, 1, 3, H, W].
         For encoder→decoder reconstruction (matching decoder extraction)."""
         render_out = _render_state_slab(env.state, xy_mm=env.curr_xy_mm)  # [H, W, 3] uint8
         t = torch.from_numpy(render_out).float().permute(2, 0, 1).to(device) / 255.0
         return t.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
-
-    def _normalize_pixels(raw_px: torch.Tensor) -> torch.Tensor:
-        """Raw [0,1] pixels → ImageNet-normalised for CEM solver."""
-        mean = IMAGENET_MEAN.to(raw_px.device).view(1, 1, 3, 1, 1)
-        std = IMAGENET_STD.to(raw_px.device).view(1, 1, 3, 1, 1)
-        return (raw_px - mean) / std
 
     # ── Goal (constant across cycles) ───────────────────────────────────
     goal_data = _to_tensor(goal_chunk[0]["pixels"])  # [1, 1, 3, H, W]
@@ -413,17 +457,17 @@ def visualize_cem_rollout(
         cycle += 1
         # ── Build info_dict for this cycle ─────────────────────────
         if total_env_steps == 0:
-            # Solver expects ImageNet-normalised pixels (matching eval pipeline),
-            # but decoder needs raw [0,1] pixels (matching decoder extraction).
+            # Solver expects raw [0,1] pixels — matches decoder extraction
+            # and the eval pipeline's transform order.
             raw_px = _to_tensor(initial[0]["pixels"])  # [1, 1, 3, H, W] raw [0,1]
             info_dict = {
-                "pixels": _normalize_pixels(raw_px),
+                "pixels": raw_px,
                 "position_xy_mm": _to_tensor(initial[0]["position_xy_mm"]),
                 "action": _to_tensor(initial[0]["action"]),
-                "goal": _normalize_pixels(goal_data),
+                "goal": goal_data,
             }
         else:
-            px = _env_pixels_to_input(env)  # [1, 1, 3, H, W]
+            px = _env_pixels_raw(env)  # [1, 1, 3, H, W] raw [0,1]
             pos = torch.from_numpy(
                 np.asarray(env.curr_xy_mm, dtype=np.float32)
             ).unsqueeze(0).to(device)  # [1, 1, 2]
@@ -432,7 +476,7 @@ def visualize_cem_rollout(
                 "pixels": px,
                 "position_xy_mm": pos,
                 "action": act,
-                "goal": _normalize_pixels(goal_data),
+                "goal": goal_data,
             }
 
         orig_info = {k: v.clone() if isinstance(v, torch.Tensor) else v
@@ -457,6 +501,9 @@ def visualize_cem_rollout(
         take = min(receding_horizon, (total_steps - total_env_steps + 3) // 4)
         best_actions = best_mean[:take].to(device)
 
+        # Denormalize from solver space back to physical units for env execution
+        physical_actions = wrapped_model.denormalize_actions(best_actions)
+
         # Save for next warm-start
         if best_mean.ndim == 2:
             prev_mean = best_mean.unsqueeze(0)  # [1, horizon, action_dim]
@@ -464,14 +511,15 @@ def visualize_cem_rollout(
             prev_mean = best_mean
 
         cost_info = (
-            f"cost={callback.cost_history[-1]:.1f}" if callback.cost_history else ""
+            f"cost trend: {callback.cost_history[0]:.1f} → {callback.cost_history[-1]:.1f}"
+            if len(callback.cost_history) >= 2 else ""
         )
-        print(f"  Cycle {cycle}: {best_actions.shape[0]} CEM actions "
+        print(f"  Cycle {cycle}: {best_actions.shape[0]} planning actions "
               f"({best_actions.shape[0] * 4} env steps)  {cost_info}")
 
         # ── Simulator execution + per-block prediction frames ──────
-        for t in range(best_actions.shape[0]):
-            block = best_actions[t].cpu().numpy().reshape(-1, 3)  # [4, 3]
+        for t in range(physical_actions.shape[0]):
+            block = physical_actions[t].cpu().numpy().reshape(-1, 3)  # [4, 3]
             for i in range(block.shape[0]):
                 obs, _, _, _, _ = env.step(
                     np.array([block[i]], dtype=np.float32)
