@@ -105,7 +105,7 @@ def _compute_all_norm_stats(dataset) -> dict[str, dict[str, list[float]]]:
     total_batches = len(loader)
 
     # Only need a small sample for stable mean/std — bounded physical quantities.
-    max_batches = min(24, total_batches)
+    max_batches = min(32, total_batches)
 
     for i, batch in enumerate(loader):
         if i % max(1, max_batches // 5) == 0:
@@ -226,6 +226,7 @@ def get_column_normalizer(dataset, source: str, target: str):
     print(f"  ⚡ Computing & caching normalization stats → {h5_path}", flush=True)
     stats = _compute_all_norm_stats(dataset)
     _NORM_CACHE[h5_path] = stats
+    dataset.close()  # release read handles so r+ can open
     try:
         _write_cached_norm_stats(h5_path, stats)
         print(f"  ✓ Cached normalization stats to HDF5 root attrs", flush=True)
