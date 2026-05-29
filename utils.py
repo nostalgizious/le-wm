@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import os
 from pathlib import Path
 from stable_pretraining import data as dt
 from lightning.pytorch.callbacks import Callback
@@ -43,17 +44,27 @@ def get_column_normalizer(dataset, source: str, target: str):
             return x.float()
         return dt.transforms.WrapTorchTransform(_id, source=source, target=target)
 
+    n_workers = min(8, max(1, os.cpu_count() or 1))
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=64, shuffle=False, num_workers=0,
+        dataset, batch_size=128, shuffle=False, num_workers=n_workers,
+        # Avoid re-importing heavy modules in worker processes
+        persistent_workers=False,
     )
 
     count = 0
     total = None
     total_sq = None
+    total_batches = len(loader)
+    n_zeros = 0
 
-    for batch in loader:
+    for i, batch in enumerate(loader):
+        if i == 0 or i % max(1, total_batches // 10) == 0 or i == total_batches - 1:
+            print(f"  Normalizing {source:20s}  batch {i+1:4d}/{total_batches}  "
+                  f"({100*(i+1)//total_batches:3d}%)  "
+                  f"samples={count:8d}  workers={n_workers}")
         data = batch.get(source)
         if data is None:
+            n_zeros += 1
             continue
         if isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
