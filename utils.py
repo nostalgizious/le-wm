@@ -86,12 +86,11 @@ def _compute_all_norm_stats(dataset) -> dict[str, dict[str, list[float]]]:
     if not columns:
         return {}
 
-    print(f"  Computing normalization stats for: {columns}")
+    print(f"  Computing normalization stats for: {columns}", flush=True)
 
-    n_workers = min(8, max(1, os.cpu_count() or 1))
+    n_workers = 0  # single-threaded: h5py handles + fork are unsafe
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=128, shuffle=False, num_workers=n_workers,
-        persistent_workers=False,
+        dataset, batch_size=256, shuffle=False, num_workers=n_workers,
     )
 
     accum: dict[str, dict] = {col: {"total": None, "total_sq": None, "count": 0}
@@ -101,7 +100,7 @@ def _compute_all_norm_stats(dataset) -> dict[str, dict[str, list[float]]]:
     for i, batch in enumerate(loader):
         if i % max(1, total_batches // 10) == 0:
             print(f"    batch {i+1:4d}/{total_batches}  "
-                  f"({100*(i+1)//total_batches:3d}%)  workers={n_workers}")
+                  f"({100*(i+1)//total_batches:3d}%)", flush=True)
 
         for col in columns:
             data = batch.get(col)
