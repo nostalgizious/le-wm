@@ -208,7 +208,10 @@ def get_column_normalizer(dataset, source: str, target: str):
         cached = _NORM_CACHE[h5_path]
         if source in cached:
             s = cached[source]
+            print(f"  ✓ Using in-memory norm cache for {source}", flush=True)
             return _make_normalizer(s["mean"], s["std"], source, target)
+        else:
+            print(f"  ⚠  In-memory cache hit but {source} missing, keys={list(cached.keys())}", flush=True)
 
     if h5_path is None:
         # Fallback: compute without caching
