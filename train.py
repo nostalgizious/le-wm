@@ -10,6 +10,8 @@ import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
+torch.set_float32_matmul_precision("high")
+
 from jepa import JEPA
 from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
@@ -68,6 +70,7 @@ def run(cfg):
             render_overrides=render_overrides,
             observation_source=cfg.data.dataset.get("observation_source", "auto"),
             return_raw=OmegaConf.select(cfg, "probe.enabled", default=False),
+            max_episodes=cfg.data.dataset.get("max_episodes"),
         )
     else:
         dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
