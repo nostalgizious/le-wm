@@ -166,7 +166,10 @@ def run(cfg):
         'model_opt': {
             "modules": 'model',
             "optimizer": dict(cfg.optimizer),
-            "scheduler": {"type": "LinearWarmupCosineAnnealingLR"},
+            "scheduler": {
+                "type": "LinearWarmupCosineAnnealingLR",
+                **OmegaConf.to_container(cfg.get("scheduler", {}), resolve=True),
+            },
             "interval": "epoch",
         },
     }

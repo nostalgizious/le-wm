@@ -37,6 +37,7 @@ optimizer:
   weight_decay: 1e-3
 
 scheduler:
+  type: LinearWarmupCosineAnnealingLR
   warmup_steps: 100
   max_steps: 10000
 
