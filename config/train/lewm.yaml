@@ -46,9 +46,6 @@ wandb:
   config:
     entity: fsandco
     project: lwm-waam
-    name: ${output_model_name}
-    id: ${subdir}
-    resume: allow
     log_model: False
 
 wm:
