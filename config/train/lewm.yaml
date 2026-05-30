@@ -21,7 +21,7 @@ trainer:
   max_epochs: 100
   devices: auto
   accelerator: gpu
-  precision: bf16
+  precision: bf16-mixed
   gradient_clip_val: 1.0
 
 loader:
@@ -35,6 +35,9 @@ optimizer:
   type: AdamW
   lr: 5e-5
   weight_decay: 1e-3
+  scheduler:
+    warmup_steps: 100
+    max_steps: 10000
 
 wandb:
   enabled: True
