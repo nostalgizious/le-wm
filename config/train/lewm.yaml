@@ -35,9 +35,10 @@ optimizer:
   type: AdamW
   lr: 5e-5
   weight_decay: 1e-3
-  scheduler:
-    warmup_steps: 100
-    max_steps: 10000
+
+scheduler:
+  warmup_steps: 100
+  max_steps: 10000
 
 wandb:
   enabled: True
