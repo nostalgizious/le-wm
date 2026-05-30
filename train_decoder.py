@@ -114,7 +114,11 @@ def train_decoder(
 
         decoder.eval()
         with torch.inference_mode():
-            val_preds = decoder(val_cls)
+            # Batched validation — avoid OOM from processing all val samples at once.
+            val_preds = []
+            for i in range(0, n_val, batch_size):
+                val_preds.append(decoder(val_cls[i : i + batch_size]).cpu())
+            val_preds = torch.cat(val_preds, dim=0).to(val_pix.device)
             val_loss = float(F.mse_loss(val_preds, val_pix))
             val_losses.append(val_loss)
 
