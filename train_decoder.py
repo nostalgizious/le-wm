@@ -22,14 +22,21 @@ import torch.nn.functional as F
 from probes import VisualDecoder
 
 
-def extract_cls_pixel_pairs(model, dataset, device="cpu", batch_size=128):
-    """Extract (cls_token, pixels) pairs from a dataset."""
+def extract_cls_pixel_pairs(model, dataset, device="cpu", batch_size=128, max_frames=None):
+    """Extract (cls_token, pixels) pairs from a dataset.
+
+    Args:
+        max_frames: If set, stop after extracting this many frames
+            (prevents OOM on datasets with millions of frames).
+    """
     model.eval()
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     all_cls = []
     all_pixels = []
     total = len(loader)
+    frame_count = 0
+
     with torch.inference_mode():
         for i, batch in enumerate(loader):
             info = {"pixels": batch["pixels"].to(device)}
@@ -39,9 +46,15 @@ def extract_cls_pixel_pairs(model, dataset, device="cpu", batch_size=128):
             all_cls.append(cls)
             img = batch["pixels"][:, 0, ...].cpu()
             all_pixels.append(img)
+            frame_count += img.shape[0]
 
             if i % 10 == 0 or i == total - 1:
-                print(f"  CLS extraction  batch {i+1}/{total}  ({100*(i+1)//total}%)")
+                print(f"  CLS extraction  batch {i+1}/{total}  ({100*(i+1)//total}%)  "
+                      f"frames={frame_count}")
+
+            if max_frames is not None and frame_count >= max_frames:
+                print(f"  (stopped at max_frames={max_frames})")
+                break
 
     return torch.cat(all_cls, dim=0), torch.cat(all_pixels, dim=0)
 
@@ -144,7 +157,9 @@ def main():
     parser.add_argument("--wandb-project", type=str, default="lwm-waam")
     parser.add_argument("--wandb-entity", type=str, default="fsandco")
     parser.add_argument("--wandb-name", type=str, default="decoder")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--max-frames", type=int, default=100000,
+                        help="Max frames for CLS extraction (default 100K, ~19 GB pixels). "
+                             "Set higher if you have more RAM.")
     parser.add_argument("--output", type=Path, default=None,
                         help="Output path for decoder_weights.pt (default: decoder_weights.pt in cwd)")
     args = parser.parse_args()
@@ -181,7 +196,8 @@ def main():
         dataset, lengths=[0.9, 0.1], generator=rnd_gen,
     )
     print(f"Extracting CLS tokens from {len(train_set)} training samples...")
-    cls_tokens, pixel_images = extract_cls_pixel_pairs(model, train_set, device=args.device)
+    cls_tokens, pixel_images = extract_cls_pixel_pairs(
+        model, train_set, device=args.device, max_frames=args.max_frames)
     print(f"Extracted {cls_tokens.size(0)} pairs. CLS: {cls_tokens.shape}, Pixels: {pixel_images.shape}")
 
     # ── Free JEPA model to make room for decoder on GPU ────────────────
