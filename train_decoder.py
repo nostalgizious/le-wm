@@ -241,7 +241,7 @@ def main():
     print(f"Final val MSE: {results['val_losses'][-1]:.6f}")
 
     # ── Save ─────────────────────────────────────────────────────────
-    save_path = args.output or Path("decoder_weights.pt")
+    save_path = (args.output or Path("decoder_weights.pt")).resolve()
     torch.save(decoder.state_dict(), save_path)
     print(f"Saved decoder weights to {save_path}")
 
