@@ -160,6 +160,7 @@ def main():
     parser.add_argument("--max-frames", type=int, default=100000,
                         help="Max frames for CLS extraction (default 100K, ~19 GB pixels). "
                              "Set higher if you have more RAM.")
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output", type=Path, default=None,
                         help="Output path for decoder_weights.pt (default: decoder_weights.pt in cwd)")
     args = parser.parse_args()
