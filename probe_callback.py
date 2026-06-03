@@ -48,6 +48,10 @@ class ProbeValidationCallback(pl.Callback):
         Batch size for MLP fitting (default 256).
     h5_attrs : dict, optional
         HDF5 root attributes for on-the-fly derived target computation.
+    max_probe_samples : int, optional
+        If set, subsample validation frames before probe fitting
+        (default None = use all).  Keep constant across dataset sizes
+        for comparable probe runtime.
     decoder_ckpt_path : str, optional
         Path to a pre-trained VisualDecoder checkpoint (state_dict or
         full module).  If provided, the decoder reconstructs images
@@ -66,6 +70,7 @@ class ProbeValidationCallback(pl.Callback):
         h5_attrs: dict | None = None,
         decoder_ckpt_path: str | None = None,
         n_decode_images: int = 4,
+        max_probe_samples: int | None = None,
     ) -> None:
         super().__init__()
         self._embed_dim = embed_dim
@@ -76,6 +81,7 @@ class ProbeValidationCallback(pl.Callback):
             "batch_size": mlp_fit_batch_size,
         }
         self._h5_attrs = h5_attrs
+        self._max_probe_samples = max_probe_samples
 
         # Probe modules — owned by this callback, not the LightningModule
         self.linear_probes = nn.ModuleDict({
@@ -227,6 +233,13 @@ class ProbeValidationCallback(pl.Callback):
         for name, lst in self._accum_targets.items():
             if lst:
                 all_targets[name] = torch.cat(lst, dim=0).to(device=device, dtype=torch.float32)
+
+        # ── Subsample if capped (constant across dataset sizes) ────────
+        n_samples = all_emb.shape[0]
+        if self._max_probe_samples is not None and n_samples > self._max_probe_samples:
+            idx = torch.randperm(n_samples)[:self._max_probe_samples]
+            all_emb = all_emb[idx]
+            all_targets = {k: v[idx] for k, v in all_targets.items()}
 
         self._pending_fit = (all_emb, all_targets)
 

@@ -71,6 +71,7 @@ loss:
 
 probe:
   enabled: false  # default off; set true for validation runs
+  max_probe_samples: 2000  # cap validation frames for probe fitting
   mlp_fit:
     epochs: 20
     lr: 1e-3

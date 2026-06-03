@@ -232,6 +232,7 @@ def run(cfg):
             mlp_fit_batch_size=cfg.probe.mlp_fit.batch_size,
             h5_attrs=h5_attrs,
             decoder_ckpt_path=decoder_ckpt,
+            max_probe_samples=cfg.probe.get("max_probe_samples", None),
         )
         extra_callbacks.append(probe_cb)
 
