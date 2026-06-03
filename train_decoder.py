@@ -82,8 +82,10 @@ def train_decoder(
     train_idx = perm[:n_train]
     val_idx = perm[n_train:]
 
-    train_cls, train_pix = cls_tokens[train_idx].to(device), pixel_images[train_idx]
-    val_cls, val_pix = cls_tokens[val_idx].to(device), pixel_images[val_idx].to(device)
+    train_cls = cls_tokens[train_idx].to(device)
+    train_pix = pixel_images[train_idx]
+    val_cls = cls_tokens[val_idx].to(device)
+    val_pix = pixel_images[val_idx]
 
     optimizer = torch.optim.AdamW(decoder.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -117,8 +119,9 @@ def train_decoder(
             # Batched validation — avoid OOM from processing all val samples at once.
             val_preds = []
             for i in range(0, n_val, batch_size):
-                val_preds.append(decoder(val_cls[i : i + batch_size]).cpu())
-            val_preds = torch.cat(val_preds, dim=0).to(val_pix.device)
+                c = val_cls[i : i + batch_size]
+                val_preds.append(decoder(c).cpu())
+            val_preds = torch.cat(val_preds, dim=0)
             val_loss = float(F.mse_loss(val_preds, val_pix))
             val_losses.append(val_loss)
 
@@ -161,8 +164,8 @@ def main():
     parser.add_argument("--wandb-project", type=str, default="lwm-waam")
     parser.add_argument("--wandb-entity", type=str, default="fsandco")
     parser.add_argument("--wandb-name", type=str, default="decoder")
-    parser.add_argument("--max-frames", type=int, default=100000,
-                        help="Max frames for CLS extraction (default 100K, ~19 GB pixels). "
+    parser.add_argument("--max-frames", type=int, default=20000,
+                        help="Max frames for CLS extraction (default 20K, ~3.8 GB pixels). "
                              "Set higher if you have more RAM.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output", type=Path, default=None,
