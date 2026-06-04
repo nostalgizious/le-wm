@@ -60,6 +60,184 @@ def get_dataset(cfg, dataset_name):
         )
     return dataset
 
+
+@torch.inference_mode()
+def run_multistep_prediction_eval(
+    model,      # JEPA / LeWM model (loaded via AutoCostModel)
+    dataset,    # WaamFlatDataset
+    cfg,        # Hydra DictConfig
+    device: str = "cuda",
+) -> dict:
+    """Offline autoregressive latent prediction eval.
+
+    Measures whether autoregressive latent prediction degrades over the
+    same frame-skipped horizon used by CEM planning.
+
+    Returns dict of metrics suitable for W&B logging.  When no valid
+    chunks exist, returns only metadata and accounting keys.
+    """
+    frameskip = getattr(dataset, 'frameskip', 1)
+    ctx_frames = cfg.wm.history_size
+    pred_frames = cfg.eval.multistep_pred_frames
+    total_loaded_frames = ctx_frames + pred_frames
+    raw_horizon_steps = pred_frames * frameskip
+
+    num_valid = 0
+    num_skipped = 0
+
+    # ── Collect valid episode starting points ──────────────────────────
+    ep_lengths = getattr(dataset, 'lengths', None)
+    if ep_lengths is None:
+        ep_lengths = getattr(dataset, 'ep_len', None)
+    ep_offsets = getattr(dataset, 'offsets', None)
+    if ep_offsets is None:
+        ep_offsets = getattr(dataset, 'ep_offset', None)
+
+    n_episodes = len(ep_lengths)
+    valid_starts: list[tuple[int, int, int]] = []  # (ep, start, length)
+
+    for ep in range(n_episodes):
+        ep_len = int(ep_lengths[ep])
+        if ep_len >= total_loaded_frames:
+            valid_starts.append((ep, 0, ep_len))
+
+    if not valid_starts:
+        return {
+            "eval/multistep_frameskip": frameskip,
+            "eval/multistep_pred_frames": pred_frames,
+            "eval/multistep_raw_steps": raw_horizon_steps,
+            "eval/multistep_num_valid_chunks": 0,
+            "eval/multistep_num_skipped_chunks": n_episodes,
+        }
+
+    # ── Sample chunks ──────────────────────────────────────────────────
+    num_chunks = min(cfg.eval.multistep_num_chunks, len(valid_starts))
+    rng = np.random.default_rng(cfg.seed + 1)  # independent seed
+    chosen = rng.choice(len(valid_starts), size=num_chunks, replace=True)
+
+    all_per_step_mse: list[torch.Tensor] = []
+
+    batch_size = cfg.eval.multistep_batch_size
+    for batch_start in range(0, num_chunks, batch_size):
+        batch_end = min(batch_start + batch_size, num_chunks)
+        batch_indices = chosen[batch_start:batch_end]
+
+        pixels_batch = []
+        actions_batch = []
+
+        for idx in batch_indices:
+            ep, _, ep_len = valid_starts[idx]
+            max_start = ep_len - total_loaded_frames
+            start = rng.integers(0, max_start + 1) if max_start > 0 else 0
+
+            chunk = dataset.load_chunk(
+                [ep], [start], [start + total_loaded_frames * frameskip]
+            )[0]
+
+            px = chunk["pixels"]  # [T, 3, H, W]
+            act = chunk.get("action")
+
+            if px.shape[0] >= total_loaded_frames:
+                px = px[:total_loaded_frames]
+                pixels_batch.append(px)
+                if act is not None:
+                    act = act[:total_loaded_frames]
+                    actions_batch.append(act)
+                num_valid += 1
+            else:
+                num_skipped += 1
+
+        if not pixels_batch:
+            continue
+
+        # Stack batch
+        pixels = torch.stack([torch.as_tensor(p, device=device) for p in pixels_batch])
+        # pixels: [B, total_loaded_frames, 3, H, W]
+
+        # ── Encode frames ──────────────────────────────────────────
+        encode_input = {"pixels": pixels}
+        if actions_batch:
+            raw_actions = np.stack(actions_batch, axis=0)
+            raw_actions = torch.nan_to_num(
+                torch.as_tensor(raw_actions, device=device, dtype=torch.float32),
+                nan=0.0,
+            )
+            encode_input["action"] = raw_actions
+
+        info = model.encode(encode_input)
+        emb_gt = info["emb"]  # [B, total_loaded_frames, D]
+
+        # ── Encode actions like training ───────────────────────────
+        if "act_emb" in info:
+            act_emb = info["act_emb"]  # [B, total_loaded_frames, D_a]
+        elif actions_batch and hasattr(model, 'action_encoder'):
+            act_emb = model.action_encoder(raw_actions)
+        else:
+            # Fallback: zero action embeddings (shouldn't happen with
+            # a properly loaded model, but keeps eval robust).
+            D = emb_gt.shape[-1]
+            act_emb = torch.zeros(
+                len(pixels_batch), total_loaded_frames, D,
+                device=device, dtype=emb_gt.dtype,
+            )
+
+        # ── Autoregressive rollout ─────────────────────────────────
+        pred = emb_gt[:, :ctx_frames].clone()
+
+        for k in range(pred_frames):
+            emb_window = pred[:, -ctx_frames:]
+            act_window = act_emb[:, k : k + ctx_frames]
+
+            out = model.predict(emb_window, act_window)
+            next_emb = out[:, -1:]
+            pred = torch.cat([pred, next_emb], dim=1)
+
+        # ── Per-step MSE ───────────────────────────────────────────
+        per_step_mse = (
+            (pred[:, ctx_frames:] - emb_gt[:, ctx_frames:]) ** 2
+        ).mean(dim=-1)  # [B, pred_frames]
+        all_per_step_mse.append(per_step_mse.cpu())
+
+    # ── Aggregate ──────────────────────────────────────────────────────
+    if not all_per_step_mse:
+        return {
+            "eval/multistep_frameskip": frameskip,
+            "eval/multistep_pred_frames": pred_frames,
+            "eval/multistep_raw_steps": raw_horizon_steps,
+            "eval/multistep_num_valid_chunks": 0,
+            "eval/multistep_num_skipped_chunks": num_skipped,
+        }
+
+    all_mse = torch.cat(all_per_step_mse, dim=0)  # [total_chunks, pred_frames]
+    mean_per_step = all_mse.mean(dim=0)  # [pred_frames]
+
+    metrics = {
+        "eval/multistep_num_valid_chunks": num_valid,
+        "eval/multistep_num_skipped_chunks": num_skipped,
+    }
+
+    for h in cfg.eval.multistep_horizons:
+        if h <= pred_frames:
+            metrics[f"eval/latent_mse_predframe@{h}"] = float(mean_per_step[h - 1])
+        else:
+            print(f"  Warning: requested horizon {h} exceeds pred_frames={pred_frames}, skipping.")
+
+    metrics["eval/latent_mse_mean"] = float(all_mse.mean())
+
+    if pred_frames > 1:
+        metrics["eval/latent_mse_auc"] = float(
+            torch.trapz(mean_per_step, dx=1.0) / (pred_frames - 1)
+        )
+    else:
+        metrics["eval/latent_mse_auc"] = float(mean_per_step[0])
+
+    metrics["eval/multistep_frameskip"] = int(frameskip)
+    metrics["eval/multistep_pred_frames"] = int(pred_frames)
+    metrics["eval/multistep_raw_steps"] = int(raw_horizon_steps)
+
+    return metrics
+
+
 @hydra.main(version_base=None, config_path="./config/eval", config_name="waam")
 def run(cfg: DictConfig):
     """Run evaluation of dinowm vs random policy."""
@@ -166,8 +344,20 @@ def run(cfg: DictConfig):
 
     world.set_policy(policy)
 
+    # ── Multi-step latent prediction eval (offline, no simulator) ──
+    metrics: dict = {}
+    if cfg.eval.get("run_multistep_eval", False) and policy != "random":
+        print("\n── Multi-step latent prediction eval ──")
+        multistep_metrics = run_multistep_prediction_eval(
+            model, dataset, cfg, device="cuda"
+        )
+        metrics.update(multistep_metrics)
+        print(f"  MSE@1={multistep_metrics.get('eval/latent_mse_predframe@1', 'N/A')}  "
+              f"MSE@25={multistep_metrics.get('eval/latent_mse_predframe@25', 'N/A')}  "
+              f"AUC={multistep_metrics.get('eval/latent_mse_auc', 'N/A')}")
+
     start_time = time.time()
-    metrics = world._evaluate_from_dataset(
+    mpc_metrics = world._evaluate_from_dataset(
         dataset,
         start_steps=eval_start_idx.tolist(),
         goal_offset=cfg.eval.goal_offset_steps,
@@ -179,6 +369,7 @@ def run(cfg: DictConfig):
     )
     end_time = time.time()
     
+    metrics.update(mpc_metrics)
     print(metrics)
 
     # ── Log CEM metrics to W&B if enabled ──
@@ -193,11 +384,15 @@ def run(cfg: DictConfig):
                 reinit=True,
             )
             wandb.log({
-                "eval/success_rate": float(metrics.get("success_rate", 0)),
+                "eval/success_rate": float(mpc_metrics.get("success_rate", 0)),
                 "eval/evaluation_time_s": end_time - start_time,
                 "eval/num_eval": int(cfg.eval.num_eval),
                 "eval/goal_offset": int(cfg.eval.goal_offset_steps),
             })
+            # Also log multistep eval metrics if available
+            if cfg.eval.get("run_multistep_eval", False):
+                wandb.log({k: v for k, v in multistep_metrics.items()
+                          if isinstance(v, (int, float))})
             wandb.finish()
         except Exception:
             pass  # W&B logging is best-effort; don't fail eval if it errors
@@ -214,6 +409,7 @@ def run(cfg: DictConfig):
 
         f.write("==== RESULTS ====\n")
         f.write(f"metrics: {metrics}\n")
+        f.write(f"mpc_metrics: {mpc_metrics}\n")
         f.write(f"evaluation_time: {end_time - start_time} seconds\n")
 
 
