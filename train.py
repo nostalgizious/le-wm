@@ -99,7 +99,7 @@ def run(cfg):
     )
 
     train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
-    val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
+    val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=True, drop_last=False)
 
     # ── Probe precondition check ─────────────────────────────────────
     if OmegaConf.select(cfg, "probe.enabled"):
@@ -238,6 +238,7 @@ def run(cfg):
 
     trainer = pl.Trainer(
         **cfg.trainer,
+        limit_val_batches=cfg.probe.get("limit_val_batches", 1.0) if cfg.probe.enabled else 1.0,
         callbacks=extra_callbacks,
         num_sanity_val_steps=0 if OmegaConf.select(cfg, "probe.enabled") else 1,
         logger=logger,
