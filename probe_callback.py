@@ -98,7 +98,6 @@ class ProbeValidationCallback(pl.Callback):
         self._accum_targets: dict[str, list[torch.Tensor]] = {
             name: [] for name in target_specs
         }
-        self._pending_fit: tuple[torch.Tensor, dict[str, torch.Tensor]] | None = None
 
         # ── Decoder (optional) ────────────────────────────────────────
         self._decoder: torch.nn.Module | None = None
@@ -223,7 +222,7 @@ class ProbeValidationCallback(pl.Callback):
         trainer: pl.Trainer,
         pl_module: pl.LightningModule,
     ) -> None:
-        """Concatenate accumulated data and store for deferred fitting."""
+        """Concatenate accumulated data, fit probes, log metrics."""
         if not self._accum_emb:
             return
 
@@ -241,27 +240,7 @@ class ProbeValidationCallback(pl.Callback):
             all_emb = all_emb[idx]
             all_targets = {k: v[idx] for k, v in all_targets.items()}
 
-        self._pending_fit = (all_emb, all_targets)
-
-        # Clear accumulators
-        self._accum_emb.clear()
-        for lst in self._accum_targets.values():
-            lst.clear()
-
-    def on_validation_end(
-        self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-    ) -> None:
-        """Fit probes, log metrics, and optionally run decoder."""
-        if self._pending_fit is None:
-            return
-
-        all_emb, all_targets = self._pending_fit
-        self._pending_fit = None
-        device = pl_module.device
-
-        # ── Move probes to device and fit ────────────────────────────
+        # ── Move probes to device and fit ──────────────────────────────
         self.linear_probes.to(device)
         self.mlp_probes.to(device)
 
@@ -273,7 +252,7 @@ class ProbeValidationCallback(pl.Callback):
             self.mlp_probes[name].train()
             fit_mlp_sgd(self.mlp_probes[name], all_emb, y, **self._mlp_fit_cfg)
 
-        # ── Compute and log probe metrics ────────────────────────────
+        # ── Compute and log probe metrics ──────────────────────────────
         with torch.inference_mode():
             for name in self._target_specs:
                 if name not in all_targets:
@@ -294,7 +273,6 @@ class ProbeValidationCallback(pl.Callback):
                     pred_var = preds.var(dim=0).mean()
                     targ_var = y.var(dim=0).mean()
 
-                    step = trainer.global_step
                     for logger in trainer.loggers:
                         logger.log_metrics({
                             f"val/{probe_type}_{name}_mse": float(mse.detach().cpu()),
@@ -302,9 +280,9 @@ class ProbeValidationCallback(pl.Callback):
                             f"val/{probe_type}_{name}_r_degenerate": float(deg_mean.detach().cpu()),
                             f"val/{probe_type}_{name}_pred_var": float(pred_var.detach().cpu()),
                             f"val/{probe_type}_{name}_targ_var": float(targ_var.detach().cpu()),
-                        }, step=step)
+                        }, step=trainer.global_step)
 
-        # ── Decoder: reconstruct first N images ───────────────────────
+        # ── Decoder: reconstruct first N images ─────────────────────────
         if self._decoder is not None and self._accum_decode_emb:
             self._decoder.to(device)
             self._decoder.eval()
@@ -315,31 +293,31 @@ class ProbeValidationCallback(pl.Callback):
             with torch.inference_mode():
                 recons = self._decoder(emb_cat[:n].float()).cpu()
 
-            # Log original + reconstructed image grids via W&B
             for logger in trainer.loggers:
                 import wandb
                 if hasattr(logger, "experiment") and isinstance(logger.experiment, type(wandb)):
                     images = []
                     for i in range(n):
-                        orig = pix_cat[i]  # [3, H, W]
-                        recon = recons[i]  # [3, H, W]
+                        orig = pix_cat[i]
+                        recon = recons[i]
                         images.append(wandb.Image(orig, caption=f"original_{i}"))
                         images.append(wandb.Image(recon, caption=f"reconstructed_{i}"))
                     logger.experiment.log({"val/decoded_images": images}, step=trainer.global_step)
-                else:
-                    # Generic metric: log reconstruction MSE
-                    recon_mse = float(F.mse_loss(recons, pix_cat[:n]).detach().cpu())
-                    logger.log_metrics({"val/decoder_mse": recon_mse}, step=trainer.global_step)
 
-            self._decoder.cpu()
-
-        # Clear decoder accumulators
+        # Clear accumulators
+        self._accum_emb.clear()
+        for lst in self._accum_targets.values():
+            lst.clear()
         self._accum_decode_emb.clear()
         self._accum_decode_pixels.clear()
 
-        # ── Move probes back to CPU ──────────────────────────────────
-        self.linear_probes.cpu()
-        self.mlp_probes.cpu()
+    def on_validation_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+    ) -> None:
+        """No-op — fitting moved to on_validation_epoch_end for correct step alignment."""
+        pass
 
     # ── State management ──────────────────────────────────────────────
 
