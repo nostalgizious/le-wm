@@ -204,6 +204,11 @@ class ProbeValidationCallback(pl.Callback):
         if goal_geom is not None:
             goal_geom = goal_geom.detach().cpu().numpy()
         else:
+            import logging
+            logging.getLogger("ProbeCallback").warning(
+                "goal_geometry missing from batch — pct_geometry will be degenerate. "
+                f"batch keys: {list(batch.keys())}"
+            )
             goal_geom = np.zeros((material.shape[0], 1, 1), dtype=np.float32)
 
         t = WaamDerivedTargets(h5_attrs=self._h5_attrs)
