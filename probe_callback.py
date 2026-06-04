@@ -196,8 +196,6 @@ class ProbeValidationCallback(pl.Callback):
         if "material" not in batch or "temperature" not in batch:
             return batch
 
-        from src.dataloader.derived_targets import WaamDerivedTargets
-
         material = batch["material"].detach().cpu().numpy()
         temperature = batch["temperature"].detach().cpu().numpy()
         goal_geom = batch.get("goal_geometry")
@@ -211,7 +209,17 @@ class ProbeValidationCallback(pl.Callback):
             )
             goal_geom = np.zeros((material.shape[0], 1, 1), dtype=np.float32)
 
-        t = WaamDerivedTargets(h5_attrs=self._h5_attrs)
+        # ── Detect if material/temp are already decoded (float in [0,1]) ──
+        # If values are in [0, 1.2], they're decoded float32 density.
+        # If values are > 255 (uint16 range), they're raw uint16.
+        if material.dtype == np.uint16 or material.max() > 1.2:
+            from src.dataloader.derived_targets import WaamDerivedTargets
+            t = WaamDerivedTargets(h5_attrs=self._h5_attrs)
+        else:
+            # Already decoded — compute pct directly (no double-decode)
+            from src.dataloader.derived_targets import WaamDerivedTargetsDecoded
+            t = WaamDerivedTargetsDecoded(h5_attrs=self._h5_attrs)
+
         sub_batch = {"material": material, "temperature": temperature, "goal_geometry": goal_geom}
         result = t(sub_batch)
 
