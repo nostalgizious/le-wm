@@ -35,3 +35,7 @@ render:
   normalize_depth: true
   return_absolute_height: false
   position_sigma_px: 5.0
+  # Which geometry to use as the goal target.
+  # "synthetic" → goal_geometry (from randlines)
+  # "final"     → final_geometry (real final material, falls back to goal_geometry if missing)
+  goal_source: synthetic
