@@ -186,6 +186,7 @@ def visualize_cem_rollout(
     from stable_worldmodel.solver.icem import ICEMSolver
 
     from probes import VisualDecoder
+    from cem_physical_prior import PhysicalCEMCost, precompute_goal_distance_map
     from src.dataloader.waam_dataset import WaamFlatDataset
     from src.environment.env import WaamEnv
 
@@ -243,6 +244,19 @@ def visualize_cem_rollout(
     action_dim_per_step = action_mean.numel()
     print(f"  action dim: {action_dim_per_step}, mean range: [{action_mean.min():.2f}, {action_mean.max():.2f}], "
           f"std range: [{action_std.min():.4f}, {action_std.max():.4f}]")
+
+    # Compute physical action std (3D) and nominal_ratio for geometric priors.
+    # action_data is 12D (frameskip=4); reshape to raw [*, 3] sub-actions.
+    raw_actions = action_data.reshape(-1, 4, 3).reshape(-1, 3)
+    physical_std = raw_actions.std(0).clamp(min=1e-6).to(device)  # [3]
+    wfs_col = raw_actions[:, 2]
+    speed = torch.sqrt(raw_actions[:, 0]**2 + raw_actions[:, 1]**2)
+    active = (wfs_col >= 1.5) & (speed > 1e-3)
+    if active.sum() > 0:
+        nominal_ratio = (wfs_col[active] / speed[active]).median().item()
+    else:
+        nominal_ratio = 0.5  # fallback
+    print(f"  physical_std (vx,vy,wfs): {physical_std.tolist()}, nominal_ratio: {nominal_ratio:.4f}")
 
     # ── Wrap model with action normalization ────────────────────────────
     wrapped_model = NormalizedCostModel(model, action_mean, action_std)
@@ -397,12 +411,35 @@ def visualize_cem_rollout(
     )
     env.reset(seed=None, options={"_goal_spec": goal_spec})
 
+    # ── Precompute goal distance map for geometric priors ──────────────
+    goal_geom_tensor = torch.from_numpy(goal_geom).float().to(device)  # [H, W]
+    distance_map = precompute_goal_distance_map(goal_geom_tensor, dx_mm=float(_attrs["dx"]))
+    workspace_bounds = {
+        "x_min_mm": float(_attrs.get("x_min_mm", 0.0)),
+        "x_max_mm": float(_attrs.get("x_max_mm", 128.0)),
+        "y_min_mm": float(_attrs.get("y_min_mm", 0.0)),
+        "y_max_mm": float(_attrs.get("y_max_mm", 128.0)),
+    }
+    print(f"  Goal distance map precomputed ({distance_map.shape[0]}×{distance_map.shape[1]}).")
+
+    # ── Wrap model with physical CEM cost ──────────────────────────────
+    physical_cost = PhysicalCEMCost(
+        wrapped_model,
+        distance_map=distance_map,
+        workspace_bounds=workspace_bounds,
+        action_block=4,
+        phys_dt=float(_attrs.get("phys_dt", 0.25)),
+        min_wfs_m_min=float(_attrs.get("min_wfs_m_min", 1.5)),
+        nominal_ratio=nominal_ratio,
+        action_std=physical_std,
+    )
+
     # ── Build iCEM solver with callback ────────────────────────────────
     plan_cfg = swm.PlanConfig(horizon=horizon, receding_horizon=receding_horizon,
                                action_block=4, history_len=3, warm_start=True)
     callback = CaptureBestRollout()
     solver = ICEMSolver(
-        model=wrapped_model, callbacks=[callback], device=device,
+        model=physical_cost, callbacks=[callback], device=device,
         noise_beta=0.0,        # white noise (standard CEM) — avoids correlated "swirling"
         num_samples=500,       # more samples for better exploration coverage
         n_steps=30,            # default iterations
