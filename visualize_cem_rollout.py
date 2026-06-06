@@ -175,6 +175,13 @@ def visualize_cem_rollout(
     horizon: int = 25,
     receding_horizon: int = 15,
     total_steps: int = 60,
+    debug_costs: bool = False,
+    lambda_latent: float | None = None,
+    lambda_off: float | None = None,
+    lambda_dir: float | None = None,
+    lambda_over: float | None = None,
+    lambda_smooth: float | None = None,
+    lambda_prog: float | None = None,
 ) -> Path | None:
     """Generate a 3-up MP4 with closed-loop MPC.
 
@@ -426,6 +433,20 @@ def visualize_cem_rollout(
     print(f"  Goal distance map precomputed ({distance_map.shape[0]}×{distance_map.shape[1]}).")
 
     # ── Wrap model with physical CEM cost ──────────────────────────────
+    lambda_kwargs = {}
+    if lambda_latent is not None:
+        lambda_kwargs["lambda_latent"] = lambda_latent
+    if lambda_off is not None:
+        lambda_kwargs["lambda_off"] = lambda_off
+    if lambda_dir is not None:
+        lambda_kwargs["lambda_dir"] = lambda_dir
+    if lambda_over is not None:
+        lambda_kwargs["lambda_over"] = lambda_over
+    if lambda_smooth is not None:
+        lambda_kwargs["lambda_smooth"] = lambda_smooth
+    if lambda_prog is not None:
+        lambda_kwargs["lambda_prog"] = lambda_prog
+
     physical_cost = PhysicalCEMCost(
         wrapped_model,
         distance_map=distance_map,
@@ -435,6 +456,7 @@ def visualize_cem_rollout(
         min_wfs_m_min=float(_attrs.get("min_wfs_m_min", 1.5)),
         nominal_ratio=nominal_ratio,
         action_std=physical_std,
+        **lambda_kwargs,
     )
 
     # ── Build iCEM solver with callback ────────────────────────────────
@@ -484,6 +506,71 @@ def visualize_cem_rollout(
     # ── Goal (constant across cycles) ───────────────────────────────────
     goal_data = _to_tensor(goal_chunk[0]["pixels"])  # [1, 1, 3, H, W]
     goal_frame = _to_uint8(goal_data[0, 0].cpu().clamp(0, 1), img_size)
+
+    # ── Debug-costs mode: sample 3 hand-coded plans and exit ──────────
+    if debug_costs:
+        print("\n=== DEBUG COSTS ===")
+        current_xy_np = np.asarray(initial[0]["position_xy_mm"], dtype=np.float32)  # [2]
+        goal_end_xy_np = np.asarray(goal_chunk[0]["position_xy_mm"], dtype=np.float32) if "position_xy_mm" in goal_chunk[0] else current_xy_np + np.array([20.0, 0.0])
+        goal_dir = goal_end_xy_np - current_xy_np
+        goal_dir = goal_dir / (np.linalg.norm(goal_dir) + 1e-8)
+        perp_dir = np.array([-goal_dir[1], goal_dir[0]], dtype=np.float32)
+
+        speed_phys = 10.0  # mm/s
+        wfs_phys = 5.0     # m/min
+
+        def _make_plan(vx, vy, wfs):
+            step = np.array([vx, vy, wfs], dtype=np.float32)
+            block = np.tile(step, 4)  # [12]
+            plan = np.tile(block[np.newaxis, :], (horizon, 1))  # [H, 12]
+            return torch.from_numpy(plan).float().unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, H, 12]
+
+        plans = {
+            "toward":   _make_plan(goal_dir[0] * speed_phys, goal_dir[1] * speed_phys, wfs_phys),
+            "sideways": _make_plan(perp_dir[0] * speed_phys, perp_dir[1] * speed_phys, wfs_phys),
+            "backward": _make_plan(-goal_dir[0] * speed_phys, -goal_dir[1] * speed_phys, wfs_phys),
+        }
+
+        info_debug = {
+            "pixels": _to_tensor(initial[0]["pixels"]),
+            "position_xy_mm": _to_tensor(current_xy_np),
+            "action": _to_tensor(initial[0]["action"]),
+            "goal": goal_data,
+        }
+
+        header = f"{'Plan':<12} {'speed':>7} {'wfs':>6} {'dist':>6} | {'latent':>8} {'off_goal':>9} {'dir':>9} {'overdep':>8} {'smooth':>8} {'prog_rwd':>9} {'prog_cost':>10} | {'total':>10}"
+        print(header)
+        print("-" * len(header))
+        for name, plan in plans.items():
+            comps = physical_cost.compute_components(info_debug, plan)
+            latent = comps["latent"].item()
+            off = comps["off_goal"].item()
+            direction = comps["direction"].item()
+            overdep = comps["overdep"].item()
+            smooth = comps["smooth"].item()
+            prog_rwd = comps["progress_reward"].item()
+            prog_cost = comps["progress_cost"].item()
+            total = comps["total"].item()
+
+            # Approximate mean distance to goal
+            B, N, H, AD = plan.shape
+            raw = plan.reshape(B, N, H, 4, 3)
+            vxy_dbg = raw[..., :2]
+            curr = torch.from_numpy(current_xy_np).float().to(device).view(1, 1, 2)
+            pts = [curr]
+            for h in range(H):
+                for s in range(4):
+                    curr = curr + vxy_dbg[:, :, h, s, :] * float(_attrs.get("phys_dt", 0.25))
+                    pts.append(curr)
+            all_pos = torch.cat(pts, dim=1)  # [1, T+1, 2]
+            from cem_physical_prior import sample_distance_map
+            dists = sample_distance_map(distance_map, all_pos, workspace_bounds)
+            avg_dist = dists.mean().item()
+            print(f"{name:<12} {speed_phys:>7.1f} {wfs_phys:>6.1f} {avg_dist:>6.1f} | {latent:>8.1f} {off:>9.1f} {direction:>9.1f} {overdep:>8.1f} {smooth:>8.1f} {prog_rwd:>9.1f} {prog_cost:>10.1f} | {total:>10.1f}")
+
+        print("\nExit (debug-costs mode).")
+        env.close()
+        return None
 
     # ── Closed-loop MPC ─────────────────────────────────────────────────
     all_pred_frames: list = []
@@ -630,7 +717,21 @@ def main():
     parser.add_argument("--receding-horizon", type=int, default=15)
     parser.add_argument("--total-steps", type=int, default=60,
                         help="Total physical env steps across all cycles (default: 60 = ~4 cycles)")
+    parser.add_argument("--debug-costs", action="store_true",
+                        help="Print cost breakdown for 3 hand-coded plans and exit (no video)")
+    parser.add_argument("--lambda-latent", type=float, default=None)
+    parser.add_argument("--lambda-off", type=float, default=None)
+    parser.add_argument("--lambda-dir", type=float, default=None)
+    parser.add_argument("--lambda-over", type=float, default=None)
+    parser.add_argument("--lambda-smooth", type=float, default=None)
+    parser.add_argument("--lambda-prog", type=float, default=None)
+    parser.add_argument("--latent-cost-weight", type=float, default=None,
+                        help="Shorthand for --lambda-latent (e.g. 0 to isolate geometric prior)")
     args = parser.parse_args()
+
+    # Resolve --latent-cost-weight shorthand
+    if args.latent_cost_weight is not None:
+        args.lambda_latent = args.latent_cost_weight
 
     visualize_cem_rollout(
         dataset_path=args.dataset,
@@ -645,6 +746,13 @@ def main():
         horizon=args.horizon,
         receding_horizon=args.receding_horizon,
         total_steps=args.total_steps,
+        debug_costs=args.debug_costs,
+        lambda_latent=args.lambda_latent,
+        lambda_off=args.lambda_off,
+        lambda_dir=args.lambda_dir,
+        lambda_over=args.lambda_over,
+        lambda_smooth=args.lambda_smooth,
+        lambda_prog=args.lambda_prog,
     )
 
 
