@@ -7,6 +7,7 @@ import lightning as pl
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
@@ -204,6 +205,17 @@ def run(cfg):
 
     # ── Probe validation callback (opt-in) ──────────────────────────────
     extra_callbacks = [object_dump_callback]
+
+    # ── Within-epoch checkpointing (for large datasets) ──
+    ckpt_every = cfg.get("checkpoint_every_n_steps", None)
+    if ckpt_every is not None and ckpt_every > 0:
+        extra_callbacks.append(ModelCheckpoint(
+            dirpath=str(run_dir),
+            filename="lewm_{step:06d}",
+            every_n_train_steps=ckpt_every,
+            save_top_k=3,
+            save_last=False,
+        ))
     if OmegaConf.select(cfg, "probe.enabled"):
         # Build h5_attrs for on-the-fly derived target computation
         h5_attrs = getattr(dataset, "probe_h5_attrs", None)

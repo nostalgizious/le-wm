@@ -24,6 +24,10 @@ trainer:
   precision: bf16-mixed
   gradient_clip_val: 1.0
 
+# Save full model object every N training steps (within-epoch).
+# Comment out or set to 0 to disable.
+checkpoint_every_n_steps: 500
+
 loader:
   batch_size: 32
   num_workers: ${num_workers}
@@ -33,7 +37,7 @@ loader:
 
 optimizer:
   type: AdamW
-  lr: 5e-5
+  lr: 7e-5
   weight_decay: 1e-3
 
 scheduler:
