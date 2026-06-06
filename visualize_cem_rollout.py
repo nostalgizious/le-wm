@@ -145,7 +145,10 @@ def encode_decode(
     Identical code path to ``ablation_study.run_decoder_video``.
     The predictor outputs of this model are in a collapsed subspace and
     cannot be decoded — this encoder→decoder path is the only way to
-    produce readable prediction frames for this checkpoint.
+    produce readable frames for this checkpoint.
+
+    NOTE: This produces a **reconstruction** of the actual simulator state,
+    NOT a model-imagined rollout.  The video layout label reflects this.
     """
     info = model.encode({"pixels": pixels})
     cls = info["emb"][:, 0, :]  # [1, D]
@@ -601,7 +604,7 @@ def visualize_cem_rollout(
     writer.close()
 
     print(f"✓ Video written: {out_path}  ({len(side_by_side)} frames)")
-    print("  Layout: [prediction | simulator | goal]")
+    print("  Layout: [reconstruction | simulator | goal]")
     return out_path
 
 
