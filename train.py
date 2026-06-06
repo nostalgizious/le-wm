@@ -213,7 +213,7 @@ def run(cfg):
             dirpath=str(run_dir),
             filename="lewm_{step:06d}",
             every_n_train_steps=ckpt_every,
-            save_top_k=3,
+            save_top_k=-1,  # save all (triggered by steps, not metric)
             save_last=False,
         ))
     if OmegaConf.select(cfg, "probe.enabled"):
