@@ -259,6 +259,9 @@ def visualize_cem_rollout(
         action_mean = torch.tensor(cached["action"]["mean"], dtype=torch.float32).to(device)
         action_std = torch.tensor(cached["action"]["std"], dtype=torch.float32).to(device)
         print(f"  Loaded action normalizer from cache ({cache_path})")
+        # Load a small sample for physical_std + nominal_ratio (can't derive from mean/std)
+        action_data = torch.from_numpy(np.asarray(ds.get_col_data("action")[:5000], dtype=np.float32))
+        action_data = action_data[~torch.isnan(action_data).any(dim=1)]
     else:
         print("Computing action normalizer stats from dataset...")
         action_data = torch.from_numpy(np.asarray(ds.get_col_data("action"), dtype=np.float32))
