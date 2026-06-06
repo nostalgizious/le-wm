@@ -245,11 +245,26 @@ def visualize_cem_rollout(
         raise ValueError(f"start_step={start_step} >= episode length={ep_len}")
 
     # ── Compute action normalizer stats (model was trained on normalized actions) ──
-    print("Computing action normalizer stats from dataset...")
-    action_data = torch.from_numpy(np.asarray(ds.get_col_data("action"), dtype=np.float32))
-    action_data = action_data[~torch.isnan(action_data).any(dim=1)]
-    action_mean = action_data.mean(0).to(device)
-    action_std = action_data.std(0).to(device)
+    # Use cached normalization stats if available (matches training normalizer).
+    import json, os
+
+    cached = None
+    if isinstance(ds.path, str):
+        cache_path = ds.path + ".norm_stats.json"
+        if os.path.exists(cache_path):
+            with open(cache_path) as fh:
+                cached = json.load(fh).get("stats", {})
+
+    if cached and "action" in cached:
+        action_mean = torch.tensor(cached["action"]["mean"], dtype=torch.float32).to(device)
+        action_std = torch.tensor(cached["action"]["std"], dtype=torch.float32).to(device)
+        print(f"  Loaded action normalizer from cache ({cache_path})")
+    else:
+        print("Computing action normalizer stats from dataset...")
+        action_data = torch.from_numpy(np.asarray(ds.get_col_data("action"), dtype=np.float32))
+        action_data = action_data[~torch.isnan(action_data).any(dim=1)]
+        action_mean = action_data.mean(0).to(device)
+        action_std = action_data.std(0).to(device)
     action_std = action_std.clamp(min=1e-6)  # avoid division by zero
     action_dim_per_step = action_mean.numel()
     print(f"  action dim: {action_dim_per_step}, mean range: [{action_mean.min():.2f}, {action_mean.max():.2f}], "
