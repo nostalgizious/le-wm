@@ -37,13 +37,13 @@ sys.path.insert(0, str(REPO_ROOT / "le-wm"))  # for "from probes...", "from jepa
 
 
 class NormalizedCostModel:
-    """Wraps a world model so that CEM/iCEM samples in normalized action space.
+    """Wraps a world model so it can be called with physical actions.
 
     The model was trained on StandardScaler-normalized actions (zero mean,
-    unit variance), but the CEM solver naturally samples from N(0, 1).
-    This wrapper applies the same normalization inside ``get_cost`` and
-    exposes ``denormalize_actions`` for converting the solver's output back
-    to physical units before execution.
+    unit variance).  This wrapper applies that normalization inside
+    ``get_cost`` so that CEM can sample in **physical** action space.
+    Best actions are already in physical units — no denormalization needed
+    before ``env.step()``.
     """
 
     def __init__(self, model: torch.nn.Module, action_mean: torch.Tensor, action_std: torch.Tensor):
@@ -182,10 +182,8 @@ def visualize_cem_rollout(
     """
     import imageio
     import gymnasium as gym
-    from omegaconf import OmegaConf
     import stable_worldmodel as swm
     from stable_worldmodel.solver.icem import ICEMSolver
-    from stable_worldmodel.policy import WorldModelPolicy
 
     from probes import VisualDecoder
     from src.dataloader.waam_dataset import WaamFlatDataset
@@ -412,16 +410,17 @@ def visualize_cem_rollout(
         alpha=0.1,             # momentum (default)
         n_elite_keep=5,        # elite injection (default)
     )
-    # iCEM clamps candidates to action bounds.  Use normalized-space bounds
-    # (±5σ) so the solver explores broadly in the space the model expects.
-    # Denormalization back to physical units happens before env.step().
+    # iCEM clamps candidates to action bounds.  Use physical-space bounds
+    # so the solver explores in the units the geometric priors expect.
+    # Normalization to model space happens inside NormalizedCostModel.get_cost().
+    # CRITICAL: WFS lower bound is 0.0 (not min_wfs_m_min) so CEM can choose idle.
     from gymnasium.spaces import Box
     raw_as = env.action_space  # Box(shape=(3,), dtype=float32)
-    norm_low = np.full(raw_as.shape, -5.0, dtype=np.float32)
-    norm_high = np.full(raw_as.shape, 5.0, dtype=np.float32)
+    physical_low = raw_as.low.copy()
+    physical_low[2] = 0.0  # allow idle / no deposition
     batched_as = Box(
-        low=norm_low[np.newaxis, :],
-        high=norm_high[np.newaxis, :],
+        low=physical_low[np.newaxis, :],
+        high=raw_as.high[np.newaxis, :],
         shape=(1,) + raw_as.shape,
         dtype=raw_as.dtype,
     )
@@ -501,8 +500,9 @@ def visualize_cem_rollout(
         take = min(receding_horizon, (total_steps - total_env_steps + 3) // 4)
         best_actions = best_mean[:take].to(device)
 
-        # Denormalize from solver space back to physical units for env execution
-        physical_actions = wrapped_model.denormalize_actions(best_actions)
+        # Best actions are already in physical units (CEM sampled in physical space).
+        # No denormalization needed — NormalizedCostModel normalizes internally.
+        physical_actions = best_actions
 
         # Save for next warm-start
         if best_mean.ndim == 2:
@@ -564,7 +564,7 @@ def visualize_cem_rollout(
     writer.close()
 
     print(f"✓ Video written: {out_path}  ({len(side_by_side)} frames)")
-    print(f"  Layout: [prediction | simulator | goal]")
+    print("  Layout: [prediction | simulator | goal]")
     return out_path
 
 
