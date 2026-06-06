@@ -167,10 +167,11 @@ def sample_distance_map(
     y_norm = 2.0 * (xy_mm[..., 1] - y_min) / max(y_max - y_min, 1e-6) - 1.0
     grid = torch.stack([x_norm, y_norm], dim=-1)  # [..., 2]
 
-    # grid_sample expects [N, H_out, W_out, 2]
+    # grid_sample expects [N, H_out, W_out, 2] with matching batch size.
     orig_shape = grid.shape
-    flat = grid.reshape(-1, 1, 1, 2)
-    dm = distance_map.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+    flat = grid.reshape(-1, 1, 1, 2)  # [N, 1, 1, 2]
+    N = flat.shape[0]
+    dm = distance_map.unsqueeze(0).unsqueeze(0).expand(N, -1, -1, -1)  # [N, 1, H, W]
     sampled = F.grid_sample(dm, flat, mode="bilinear", padding_mode="border", align_corners=True)
     return sampled.reshape(orig_shape[:-1])  # [...] — drop the final dims
 
@@ -217,7 +218,7 @@ def compute_wrong_direction_penalty(
     Returns:
         ``[B, N]`` per-candidate penalty.
     """
-    B, N, H, AB = vxy.shape
+    B, N, H, AB, _ = vxy.shape
     T = positions.shape[2]
 
     # Flatten vxy to match positions: [B, N, T, 2]
