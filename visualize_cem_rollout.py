@@ -490,7 +490,10 @@ def visualize_cem_rollout(
         topk=50,               # slightly larger elite set
         alpha=0.1,             # momentum (default)
         n_elite_keep=5,        # elite injection (default)
-        var_scale=15.0,        # wide initial variance for physical action space (±30 mm/s)
+        # Per-dimension initial variance: [vx, vy, wfs] — solver auto-tiles to action_dim.
+        var_scale=torch.tensor(
+            [15.0, 15.0, 3.0], device=device, dtype=torch.float32
+        ),
     )
     # iCEM clamps candidates to action bounds.  Use physical-space bounds
     # so the solver explores in the units the geometric priors expect.
