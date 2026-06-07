@@ -301,6 +301,149 @@ def compute_action_smoothness(
     return (diffs**2).sum(dim=(-2, -1))  # [B, N]
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Raw-step dynamics penalties (WAAM-specific, 0.25 s resolution)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _normalize_prev_action_raw(
+    prev_action: torch.Tensor,
+    num_candidates: int,
+) -> torch.Tensor:
+    """Normalise a previous raw action tensor to ``[B, N, 3]``.
+
+    Supported input shapes:
+    - ``[B, 3]``        → expand to ``[B, N, 3]``
+    - ``[B, 1, 3]``     → expand to ``[B, N, 3]``
+    - ``[B, N, 3]``     → return as-is
+    - ``[B, N, 1, 3]``  → squeeze to ``[B, N, 3]``
+
+    Raises:
+        ValueError: Unsupported shape.
+    """
+    ndim = prev_action.ndim
+    shape = prev_action.shape
+
+    if ndim == 2 and shape[-1] == 3:  # [B, 3]
+        return prev_action.unsqueeze(1).expand(-1, num_candidates, -1)
+    if ndim == 3 and shape[-1] == 3 and shape[-2] == 1:  # [B, 1, 3]
+        return prev_action.expand(-1, num_candidates, -1)
+    if ndim == 3 and shape[-1] == 3:  # [B, N, 3] or [B, 1, 3]
+        if shape[-2] == num_candidates:
+            return prev_action
+        if shape[-2] == 1:
+            return prev_action.expand(-1, num_candidates, -1)
+        raise ValueError(
+            f"Expected prev_action shape [B, 3], [B, 1, 3], [B, N, 3], or [B, N, 1, 3], "
+            f"got {tuple(prev_action.shape)} with num_candidates={num_candidates}"
+        )
+    if ndim == 4 and shape[-1] == 3 and shape[-2] == 1:  # [B, N, 1, 3]
+        return prev_action.squeeze(-2)
+
+    raise ValueError(
+        f"Unsupported prev_action shape: {tuple(prev_action.shape)}. "
+        f"Expected [B, 3], [B, 1, 3], [B, N, 3], or [B, N, 1, 3]."
+    )
+
+
+def compute_action_rate_penalty(
+    action_candidates: torch.Tensor,          # [B, N, H, action_block * 3]
+    *,
+    action_block: int,
+    prev_action_raw: torch.Tensor | None = None,  # [B, 3], [B, 1, 3], or [B, N, 3]
+    delta_scale: torch.Tensor | None = None,       # [3] — allowed per-step change
+    accel_scale: torch.Tensor | None = None,       # [3] — allowed per-step accel
+    delta_limit: torch.Tensor | None = None,       # [3] — hard slew limit
+    include_accel: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Raw-substep WAAM dynamics penalties at 0.25 s resolution.
+
+    Smoothness is enforced at the raw control timestep, not only at
+    horizon-step / block level.  The first planned raw action is anchored
+    to ``prev_action_raw`` (the last executed real action) to penalise
+    discontinuities at MPC cycle boundaries.
+
+    Args:
+        action_candidates: Planned action blocks ``[B, N, H, AD]`` where
+            ``AD = action_block * 3``.  Layout: substep0(vx,vy,wfs),
+            substep1(vx,vy,wfs), ...
+        action_block: Number of raw substeps per horizon step (typ. 4).
+        prev_action_raw: Previous executed raw action ``[vx, vy, wfs]``.
+            Used to anchor the first planned substep.  If ``None``, no
+            anchoring — the first planned step is unconstrained.
+        delta_scale: Per-channel allowed change per raw step ``[3]``.
+            Used to normalise first-differences so vx/vy (mm/s) and wfs
+            (m/min) are comparable.  Initial heuristic defaults:
+            ``[2.0, 2.0, 0.5]`` (mm/s, mm/s, m/min per 0.25 s).
+        accel_scale: Per-channel allowed acceleration ``[3]`` for optional
+            second-difference (jerk) penalty.  Only used if
+            ``include_accel=True``.
+        delta_limit: Per-channel hard slew-rate limit ``[3]``.  Excess
+            beyond ``|Δ| > limit`` is penalised separately.
+        include_accel: If ``True``, also compute second-difference penalty.
+
+    Returns:
+        Dict with keys ``rate``, ``accel`` (zeros if disabled), ``slew``
+        (zeros if no limit), ``total``.  Each ``[B, N]``.
+    """
+    B, N, H, AD = action_candidates.shape
+    # Reshape to raw sub-actions: [B, N, H, action_block, 3] → [B, N, T, 3]
+    raw = action_candidates.reshape(B, N, H, action_block, 3)
+    T = H * action_block
+
+    # Build raw sequence, optionally anchoring to prev_action.
+    if prev_action_raw is not None:
+        # Normalise to [B, N, 3].
+        pa = _normalize_prev_action_raw(prev_action_raw, N)
+        T_extra = 1
+        raw_flat = raw.reshape(B, N, T, 3)
+        # Prepend prev_action: [B, N, T_extra + T, 3]
+        seq = torch.cat([pa.unsqueeze(2), raw_flat], dim=2)
+    else:
+        T_extra = 0
+        seq = raw.reshape(B, N, T, 3)
+
+    T_all = T + T_extra
+
+    # ── First-difference (rate) penalty ──
+    # Δ_t = seq[..., t, :] - seq[..., t-1, :]  for t in [1, T_all)
+    diffs = seq[:, :, 1:, :] - seq[:, :, :-1, :]  # [B, N, T_all-1, 3]
+
+    if delta_scale is not None:
+        ds = delta_scale.to(device=diffs.device, dtype=diffs.dtype).clamp_min(1e-6)
+        diffs_norm = diffs / ds  # [B, N, T_all-1, 3]
+    else:
+        diffs_norm = diffs
+
+    # Separate velocity (channels 0-1) and WFS (channel 2) for independent weighting.
+    rate_v = (diffs_norm[:, :, :, :2] ** 2).sum(dim=-1).sum(dim=-1)  # [B, N]
+    rate_wfs = (diffs_norm[:, :, :, 2] ** 2).sum(dim=-1)  # [B, N]
+    rate_total = rate_v + rate_wfs
+
+    # ── Optional second-difference (accel / jerk) penalty ──
+    accel = torch.zeros(B, N, device=diffs.device, dtype=diffs.dtype)
+    if include_accel and T_all >= 3:
+        # Δ²_t = seq[..., t, :] - 2·seq[..., t-1, :] + seq[..., t-2, :]
+        accel_diffs = (
+            seq[:, :, 2:, :] - 2.0 * seq[:, :, 1:-1, :] + seq[:, :, :-2, :]
+        )  # [B, N, T_all-2, 3]
+        if accel_scale is not None:
+            a_s = accel_scale.to(device=diffs.device, dtype=diffs.dtype).clamp_min(1e-6)
+            accel_diffs = accel_diffs / a_s
+        accel = (accel_diffs ** 2).sum(dim=(-2, -1))  # [B, N]
+
+    # ── Optional hard slew-rate penalty ──
+    slew = torch.zeros(B, N, device=diffs.device, dtype=diffs.dtype)
+    if delta_limit is not None:
+        dl = delta_limit.to(device=diffs.device, dtype=diffs.dtype)
+        excess = F.relu(diffs.abs() - dl)  # [B, N, T_all-1, 3]
+        slew = (excess ** 2).sum(dim=(-2, -1))  # [B, N]
+
+    total = rate_total + accel + slew
+    return {"rate": rate_total, "rate_v": rate_v, "rate_wfs": rate_wfs,
+            "accel": accel, "slew": slew, "total": total}
+
+
 def compute_on_goal_forward_progress(
     positions: torch.Tensor,       # [B, N, T, 2]
     mass: torch.Tensor,            # [B, N, T]
@@ -364,8 +507,17 @@ class PhysicalCEMCost:
         lambda_off: float = 100.0,
         lambda_dir: float = 20.0,
         lambda_over: float = 10.0,
-        lambda_smooth: float = 0.05,
-        lambda_prog: float = 5.0,
+        lambda_smooth: float = 0.01,     # weak block-level regularizer only
+        lambda_prog: float = 30.0,
+        # ── Raw-step dynamics (WAAM-specific, 0.25 s resolution) ──
+        lambda_rate_v: float = 5.0,
+        lambda_rate_wfs: float = 2.0,
+        lambda_accel: float = 0.0,
+        lambda_slew: float = 10.0,
+        delta_scale: torch.Tensor | None = None,   # [3] per-step allowed change
+        accel_scale: torch.Tensor | None = None,   # [3] per-step allowed accel
+        delta_limit: torch.Tensor | None = None,   # [3] hard slew limit
+        include_accel: bool = False,
     ):
         self.model = model
         self.distance_map = distance_map
@@ -383,6 +535,14 @@ class PhysicalCEMCost:
         self.lambda_over = lambda_over
         self.lambda_smooth = lambda_smooth
         self.lambda_prog = lambda_prog
+        self.lambda_rate_v = lambda_rate_v
+        self.lambda_rate_wfs = lambda_rate_wfs
+        self.lambda_accel = lambda_accel
+        self.lambda_slew = lambda_slew
+        self.delta_scale = delta_scale
+        self.accel_scale = accel_scale
+        self.delta_limit = delta_limit
+        self.include_accel = include_accel
 
     def parameters(self):
         """Forward to wrapped model — required by ICEMSolver for dtype inference."""
@@ -460,6 +620,34 @@ class PhysicalCEMCost:
             speed, wfs, mass_all, self.nominal_ratio, self.ratio_max,
         )
         smooth = compute_action_smoothness(action_candidates, action_std)
+
+        # ── Raw-step dynamics penalties (WAAM-specific, 0.25 s resolution) ──
+        # Cast stored tensors for rate penalty.
+        delta_scale = (
+            self.delta_scale.to(device=device, dtype=dtype)
+            if self.delta_scale is not None else None
+        )
+        accel_scale = (
+            self.accel_scale.to(device=device, dtype=dtype)
+            if self.accel_scale is not None else None
+        )
+        delta_limit = (
+            self.delta_limit.to(device=device, dtype=dtype)
+            if self.delta_limit is not None else None
+        )
+        # Read previous raw action for MPC cycle-boundary anchoring.
+        prev_action_raw = info_dict.get("prev_action_raw", None)
+
+        rate_components = compute_action_rate_penalty(
+            action_candidates,
+            action_block=self.action_block,
+            prev_action_raw=prev_action_raw,
+            delta_scale=delta_scale,
+            accel_scale=accel_scale,
+            delta_limit=delta_limit,
+            include_accel=self.include_accel,
+        )
+
         progress_reward = compute_on_goal_forward_progress(
             positions, mass_all, current_xy, distance_map,
             self.workspace_bounds,
@@ -471,6 +659,10 @@ class PhysicalCEMCost:
             + self.lambda_dir * wrong_dir
             + self.lambda_over * overdep
             + self.lambda_smooth * smooth
+            + self.lambda_rate_v * rate_components["rate_v"]
+            + self.lambda_rate_wfs * rate_components["rate_wfs"]
+            + self.lambda_accel * rate_components["accel"]
+            + self.lambda_slew * rate_components["slew"]
             - self.lambda_prog * progress_reward
         )
         return {
@@ -479,6 +671,10 @@ class PhysicalCEMCost:
             "direction": wrong_dir,
             "overdep": overdep,
             "smooth": smooth,
+            "rate_v": rate_components["rate_v"],
+            "rate_wfs": rate_components["rate_wfs"],
+            "accel": rate_components["accel"],
+            "slew": rate_components["slew"],
             "progress_reward": progress_reward,
             "progress_cost": -self.lambda_prog * progress_reward,
             "total": total,
