@@ -522,7 +522,8 @@ def visualize_cem_rollout(
         return t.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
 
     # ── Goal (constant across cycles) ───────────────────────────────────
-    goal_data = _to_tensor(goal_chunk[0]["pixels"])  # [1, 1, 3, H, W]
+    goal_pixels = goal_chunk[0]["goal"]  # [1, 3, H, W] — geometry/temp/zero channels
+    goal_data = _to_tensor(goal_pixels)  # [1, 1, 3, H, W]
     goal_frame = _to_uint8(goal_data[0, 0].cpu().clamp(0, 1), img_size)
 
     # ── Debug-costs mode: sample 3 hand-coded plans and exit ──────────
