@@ -429,6 +429,7 @@ def visualize_cem_rollout(
     from src.config.config_datagen import GoalSpec
     start_xy = np.asarray(initial[0]["position_xy_mm"], dtype=np.float32)  # [2]
     goal_image = np.asarray(goal_chunk[0]["goal"][0], dtype=np.float32)  # [3, H, W]
+    goal_image[2, ...] = goal_image[0, ...]
     # Get per-episode goal_geometry from the HDF5 episode group
     g = ds._episode_group(int(episode_idx))
     goal_geom = np.asarray(g["goal_geometry"], dtype=np.float32)  # [H, W]
@@ -489,6 +490,7 @@ def visualize_cem_rollout(
         topk=50,               # slightly larger elite set
         alpha=0.1,             # momentum (default)
         n_elite_keep=5,        # elite injection (default)
+        var_scale=15.0,        # wide initial variance for physical action space (±30 mm/s)
     )
     # iCEM clamps candidates to action bounds.  Use physical-space bounds
     # so the solver explores in the units the geometric priors expect.

@@ -307,12 +307,14 @@ def compute_on_goal_forward_progress(
     start_xy: torch.Tensor,        # [B, N, 2]
     distance_map: torch.Tensor,    # [H, W]
     workspace_bounds: dict[str, float],
-    on_goal_radius_mm: float,
 ) -> torch.Tensor:
-    """Reward depositing near the goal while making forward progress.
+    """Reward depositing while making forward progress toward the goal.
 
     Uses **incremental** progress (delta between consecutive positions)
-    to avoid over-rewarding later points.
+    to avoid over-rewarding later points.  Rewards ANY reduction in
+    distance-to-goal so CEM can navigate from far-away starting positions.
+
+    The ``mass`` gate ensures no reward for idle / non-depositing steps.
 
     Returns:
         ``[B, N]`` positive reward (should be **subtracted** from cost).
@@ -325,8 +327,11 @@ def compute_on_goal_forward_progress(
     D_prev = torch.cat([D_start.unsqueeze(-1), D[..., :-1]], dim=-1)
     delta_D = F.relu(D_prev - D)  # reduction in distance = progress [B, N, T]
 
-    near_goal = (D < on_goal_radius_mm).float()
-    reward = (mass * delta_D * near_goal).sum(dim=-1)  # [B, N]
+    # Reward ANY reduction in distance-to-goal, weighted by deposition mass.
+    # The mass gate already ensures no reward for idle steps.
+    # No near_goal gate — we need a gradient even when far from the goal,
+    # otherwise CEM cannot navigate toward it.
+    reward = (mass * delta_D).sum(dim=-1)  # [B, N]
     return reward
 
 
@@ -352,7 +357,6 @@ class PhysicalCEMCost:
         phys_dt: float = 0.25,
         min_wfs_m_min: float = 1.5,
         allowed_radius_mm: float = 6.0,
-        on_goal_radius_mm: float = 8.0,
         nominal_ratio: float = 0.5,
         ratio_max: float = 2.0,
         action_std: torch.Tensor | None = None,
@@ -370,7 +374,6 @@ class PhysicalCEMCost:
         self.phys_dt = phys_dt
         self.min_wfs_m_min = min_wfs_m_min
         self.allowed_radius_mm = allowed_radius_mm
-        self.on_goal_radius_mm = on_goal_radius_mm
         self.nominal_ratio = nominal_ratio
         self.ratio_max = ratio_max
         self.action_std = action_std
@@ -459,7 +462,7 @@ class PhysicalCEMCost:
         smooth = compute_action_smoothness(action_candidates, action_std)
         progress_reward = compute_on_goal_forward_progress(
             positions, mass_all, current_xy, distance_map,
-            self.workspace_bounds, self.on_goal_radius_mm,
+            self.workspace_bounds,
         )
 
         total = (
