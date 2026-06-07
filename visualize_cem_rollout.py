@@ -182,6 +182,14 @@ def visualize_cem_rollout(
     lambda_over: float | None = None,
     lambda_smooth: float | None = None,
     lambda_prog: float | None = None,
+    lambda_rate_v: float | None = None,
+    lambda_rate_wfs: float | None = None,
+    lambda_accel: float | None = None,
+    lambda_slew: float | None = None,
+    dvx_max: float | None = None,
+    dvy_max: float | None = None,
+    dwfs_max: float | None = None,
+    disable_accel_penalty: bool = False,
 ) -> Path | None:
     """Generate a 3-up MP4 with closed-loop MPC.
 
@@ -465,6 +473,24 @@ def visualize_cem_rollout(
         lambda_kwargs["lambda_smooth"] = lambda_smooth
     if lambda_prog is not None:
         lambda_kwargs["lambda_prog"] = lambda_prog
+    if lambda_rate_v is not None:
+        lambda_kwargs["lambda_rate_v"] = lambda_rate_v
+    if lambda_rate_wfs is not None:
+        lambda_kwargs["lambda_rate_wfs"] = lambda_rate_wfs
+    if lambda_accel is not None:
+        lambda_kwargs["lambda_accel"] = lambda_accel
+    if lambda_slew is not None:
+        lambda_kwargs["lambda_slew"] = lambda_slew
+    if disable_accel_penalty:
+        lambda_kwargs["include_accel"] = False
+
+    # Build delta_scale tensor from CLI overrides (or pass None for defaults).
+    delta_scale = None
+    if dvx_max is not None or dvy_max is not None or dwfs_max is not None:
+        dvx = dvx_max if dvx_max is not None else 2.0
+        dvy = dvy_max if dvy_max is not None else 2.0
+        dwfs = dwfs_max if dwfs_max is not None else 0.5
+        delta_scale = torch.tensor([dvx, dvy, dwfs], device=device, dtype=torch.float32)
 
     physical_cost = PhysicalCEMCost(
         wrapped_model,
@@ -475,6 +501,7 @@ def visualize_cem_rollout(
         min_wfs_m_min=float(_attrs.get("min_wfs_m_min", 1.5)),
         nominal_ratio=nominal_ratio,
         action_std=physical_std,
+        delta_scale=delta_scale,
         **lambda_kwargs,
     )
 
@@ -562,7 +589,7 @@ def visualize_cem_rollout(
             "goal": goal_data,
         }
 
-        header = f"{'Plan':<12} {'speed':>7} {'wfs':>6} {'dist':>6} | {'latent':>8} {'off_goal':>9} {'dir':>9} {'overdep':>8} {'smooth':>8} {'prog_rwd':>9} {'prog_cost':>10} | {'total':>10}"
+        header = f"{'Plan':<12} {'speed':>7} {'wfs':>6} {'dist':>6} | {'latent':>8} {'off_goal':>9} {'dir':>9} {'overdep':>8} {'smooth':>8} {'rate_v':>7} {'rate_wfs':>8} {'accel':>7} {'slew':>7} {'prog_rwd':>9} {'prog_cost':>10} | {'total':>10}"
         print(header)
         print("-" * len(header))
         for name, plan in plans.items():
@@ -572,6 +599,10 @@ def visualize_cem_rollout(
             direction = comps["direction"].item()
             overdep = comps["overdep"].item()
             smooth = comps["smooth"].item()
+            rate_v = comps.get("rate_v", torch.tensor(0.0)).item()
+            rate_wfs = comps.get("rate_wfs", torch.tensor(0.0)).item()
+            accel = comps.get("accel", torch.tensor(0.0)).item()
+            slew = comps.get("slew", torch.tensor(0.0)).item()
             prog_rwd = comps["progress_reward"].item()
             prog_cost = comps["progress_cost"].item()
             total = comps["total"].item()
@@ -590,7 +621,7 @@ def visualize_cem_rollout(
             from cem_physical_prior import sample_distance_map
             dists = sample_distance_map(distance_map, all_pos, workspace_bounds)
             avg_dist = dists.mean().item()
-            print(f"{name:<12} {speed_phys:>7.1f} {wfs_phys:>6.1f} {avg_dist:>6.1f} | {latent:>8.1f} {off:>9.1f} {direction:>9.1f} {overdep:>8.1f} {smooth:>8.1f} {prog_rwd:>9.1f} {prog_cost:>10.1f} | {total:>10.1f}")
+            print(f"{name:<12} {speed_phys:>7.1f} {wfs_phys:>6.1f} {avg_dist:>6.1f} | {latent:>8.1f} {off:>9.1f} {direction:>9.1f} {overdep:>8.1f} {smooth:>8.1f} {rate_v:>7.1f} {rate_wfs:>8.1f} {accel:>7.1f} {slew:>7.1f} {prog_rwd:>9.1f} {prog_cost:>10.1f} | {total:>10.1f}")
 
         print("\nExit (debug-costs mode).")
         env.close()
@@ -601,6 +632,7 @@ def visualize_cem_rollout(
     all_sim_frames: list = []
     total_env_steps = 0
     prev_mean: torch.Tensor | None = None  # warm-start for CEM
+    prev_action_raw = None  # [1, 3] — last executed raw action for MPC anchoring
     cycle = 0
 
     while total_env_steps < total_steps:
@@ -615,6 +647,8 @@ def visualize_cem_rollout(
                 "position_xy_mm": _to_tensor(initial[0]["position_xy_mm"]),
                 "action": _to_tensor(initial[0]["action"]),
                 "goal": goal_data,
+                # Cycle 0: no previous executed action — use zeros as neutral anchor.
+                "prev_action_raw": torch.zeros(1, 3, device=device, dtype=torch.float32),
             }
         else:
             px = _env_pixels_raw(env)  # [1, 1, 3, H, W] raw [0,1]
@@ -627,6 +661,11 @@ def visualize_cem_rollout(
                 "position_xy_mm": pos,
                 "action": act,
                 "goal": goal_data,
+                # Anchor first planned substep to last executed real action.
+                "prev_action_raw": (
+                    prev_action_raw if prev_action_raw is not None
+                    else torch.zeros(1, 3, device=device, dtype=torch.float32)
+                ),
             }
 
         orig_info = {k: v.clone() if isinstance(v, torch.Tensor) else v
@@ -685,6 +724,11 @@ def visualize_cem_rollout(
             with torch.inference_mode():
                 pred_frame = encode_decode(model, decoder, raw_px)  # [3, H, W]
             all_pred_frames.append(_to_uint8(pred_frame, img_size))
+
+        # Store last executed raw action for MPC cycle-boundary anchoring.
+        # Use the final raw substep of the last executed block.
+        last_block = physical_actions[-1].reshape(-1, 3)  # [4, 3]
+        prev_action_raw = last_block[-1:].clone().to(device)  # [1, 3]
 
         if total_env_steps >= total_steps:
             break
@@ -751,6 +795,18 @@ def main():
     parser.add_argument("--lambda-prog", type=float, default=None)
     parser.add_argument("--latent-cost-weight", type=float, default=None,
                         help="Shorthand for --lambda-latent (e.g. 0 to isolate geometric prior)")
+    parser.add_argument("--lambda-rate-v", type=float, default=None)
+    parser.add_argument("--lambda-rate-wfs", type=float, default=None)
+    parser.add_argument("--lambda-accel", type=float, default=None)
+    parser.add_argument("--lambda-slew", type=float, default=None)
+    parser.add_argument("--dvx-max", type=float, default=None,
+                        help="Allowed vx change per raw 0.25s step (mm/s)")
+    parser.add_argument("--dvy-max", type=float, default=None,
+                        help="Allowed vy change per raw 0.25s step (mm/s)")
+    parser.add_argument("--dwfs-max", type=float, default=None,
+                        help="Allowed wfs change per raw 0.25s step (m/min)")
+    parser.add_argument("--disable-accel-penalty", action="store_true",
+                        help="Disable second-difference (jerk) penalty")
     args = parser.parse_args()
 
     # Resolve --latent-cost-weight shorthand
@@ -777,6 +833,14 @@ def main():
         lambda_over=args.lambda_over,
         lambda_smooth=args.lambda_smooth,
         lambda_prog=args.lambda_prog,
+        lambda_rate_v=args.lambda_rate_v,
+        lambda_rate_wfs=args.lambda_rate_wfs,
+        lambda_accel=args.lambda_accel,
+        lambda_slew=args.lambda_slew,
+        dvx_max=args.dvx_max,
+        dvy_max=args.dvy_max,
+        dwfs_max=args.dwfs_max,
+        disable_accel_penalty=args.disable_accel_penalty,
     )
 
 
