@@ -20,14 +20,10 @@ dataset:
     - position_xy_mm
     - ir
     - depth
-    # Material and temperature raw slabs — loaded ONLY during validation
-    # for probe fitting (peak_temp_k, pct_geometry).  Including them in
-    # training dataloader causes CPU OOM on limited-RAM machines because
-    # each sample carries [T,6,128,128] float32 × 2 = up to 5 MB/sample.
-    # The probe callback checks for them in the batch and handles missing
-    # data gracefully, so we omit them from the training config.
-    # - material
-    # - temperature
+    # Material and temperature raw slabs — required when probe.enabled = true
+    # to compute peak_temp_k and pct_geometry probe targets.
+    - material
+    - temperature
 
 render:
   projection_mode: 0
