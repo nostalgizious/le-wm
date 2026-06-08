@@ -18,15 +18,12 @@ dataset:
     - pixels
     - action
     - position_xy_mm
+    - ir
+    - depth
     # Material and temperature raw slabs — required when probe.enabled = true
     # to compute peak_temp_k and pct_geometry probe targets.
     - material
     - temperature
-    # NOTE: do NOT add "ir" or "depth" to keys_to_load.
-    # They are computed columns (rendered on-the-fly from raw slabs) and
-    # get_col_data() decompresses every sample to produce them — this is
-    # extremely slow on large datasets (>10× slowdown).  The model uses
-    # "pixels" (pre-cached render) for training, not raw ir/depth. 
 
 render:
   projection_mode: 0
