@@ -74,20 +74,34 @@ class NormalizedCostModel:
 
 
 class CaptureBestRollout:
-    """iCEM callback that records the best action sequence per iteration."""
+    """iCEM callback that records the best action sequence per iteration.
 
-    def __init__(self):
+    When constructed with a *cost_model* (``PhysicalCEMCost``), also logs
+    per-iteration diagnostics: which candidate index won, how far the mean
+    drifted, and a component breakdown of the best candidate's cost.
+    """
+
+    def __init__(self, cost_model=None):
         self.best_mean: torch.Tensor | None = None  # [B, horizon, action_dim]
         self.cost_history: list[float] = []
         self.mean_history: list[torch.Tensor] = []
         self.history: list = []  # required by CEM solver
         self.output_key: str = "CaptureBestRollout"  # required by CEM solver
+        self._cost_model = cost_model
+        self._info_dict: dict | None = None
+
+    def set_info(self, info_dict: dict) -> None:
+        """Store the current MPC-cycle info_dict for component breakdowns."""
+        self._info_dict = {k: v for k, v in info_dict.items()}
 
     def reset(self):
         self.best_mean = None
         self.cost_history.clear()
         self.mean_history.clear()
         self.history.clear()
+        # _info_dict is NOT cleared here — the solver calls reset() at the
+        # start of solve(), and set_info() is always called right before
+        # solve() from the MPC loop, so it will be fresh.
 
     def start_batch(self):
         pass
@@ -98,14 +112,74 @@ class CaptureBestRollout:
     def __call__(self, **kwargs):
         step = kwargs.get("step", 0)
         mean = kwargs["mean"]  # [B, horizon, action_dim] — current best mean
+        prev_mean = kwargs.get("prev_mean")  # [B, horizon, action_dim] or None
         topk_vals = kwargs["topk_vals"]  # [B, K]
+        topk_inds = kwargs["topk_inds"]  # [B, K]
+        topk_candidates = kwargs["topk_candidates"]  # [B, K, horizon, action_dim]
+
         self.best_mean = mean.clone()
         best = float(topk_vals[:, 0].mean())  # mean of best elite cost across batch
         topk_avg = float(topk_vals.mean())  # mean of all top-k costs
         self.cost_history.append(best)
         self.mean_history.append(mean.clone())
+
         if step % 5 == 0 or step == 0:
+            # ── Diagnostic 1: which candidate won ──────────────────────
+            best_idx = int(topk_inds[:, 0].mode().values.item())
+            # ── Diagnostic 2: mean drift ───────────────────────────────
+            if prev_mean is not None:
+                drift = float((mean - prev_mean).detach().flatten(1).norm(dim=-1).mean())
+            else:
+                drift = float("nan")
+            # ── Diagnostic 3: cost-component breakdown of best action ──
+            comp_str = ""
+            if self._cost_model is not None and self._info_dict is not None:
+                comp_str = self._best_components_str(topk_candidates, topk_inds)
+
+            diag = f"best_idx={best_idx}  |Δμ|={drift:.4f}{comp_str}"
             print(f"    iCEM iter {step:2d}: best={best:.2f}  topk_avg={topk_avg:.2f}")
+            print(f"                {diag}")
+
+    def _best_components_str(
+        self, topk_candidates: "torch.Tensor", topk_inds: "torch.Tensor",
+    ) -> str:
+        """Return a one-line component breakdown for the best candidate."""
+        import torch as _torch
+
+        # Best action: first elite × first batch → [1, 1, H, AD]
+        best_action = topk_candidates[0:1, 0:1, :, :]
+        # Add N=1 sample dimension to info_dict entries (the solver normally
+        # does this via unsqueeze(1).expand(B, N, ...) before calling get_cost).
+        info_single: dict = {}
+        for k, v in self._info_dict.items():
+            if _torch.is_tensor(v):
+                info_single[k] = v[:1].unsqueeze(1)  # [B, ...] → [1, 1, ...]
+            elif isinstance(v, (list, tuple)):
+                info_single[k] = [v[0]] if len(v) > 0 else v
+            else:
+                info_single[k] = v
+
+        try:
+            comps = self._cost_model.compute_components(info_single, best_action)
+        except Exception:
+            return ""  # silently skip if compute_components fails
+
+        def _f(key: str) -> str:
+            val = comps.get(key)
+            if val is None:
+                return "?"
+            try:
+                if val.numel() == 0:
+                    return "?"
+            except AttributeError:
+                pass
+            return f"{float(val.mean()):.1f}"
+
+        return (
+            f"  latent={_f('latent')}  off={_f('off_goal')}  dir={_f('direction')}"
+            f"  over={_f('overdep')}  rate_v={_f('rate_v')}  rate_w={_f('rate_wfs')}"
+            f"  slew={_f('slew')}  prog={_f('progress_reward')}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -204,7 +278,7 @@ def visualize_cem_rollout(
     from stable_worldmodel.solver.icem import ICEMSolver
 
     from probes import VisualDecoder
-    from cem_physical_prior import PhysicalCEMCost, precompute_goal_distance_map
+    from cem_physical_prior import PhysicalCEMCost, PolarActionWrapper, precompute_goal_distance_map
     from src.dataloader.waam_dataset import WaamFlatDataset
     from src.environment.env import WaamEnv
 
@@ -484,13 +558,11 @@ def visualize_cem_rollout(
     if disable_accel_penalty:
         lambda_kwargs["include_accel"] = False
 
-    # Build delta_scale tensor from CLI overrides (or pass None for defaults).
-    delta_scale = None
-    if dvx_max is not None or dvy_max is not None or dwfs_max is not None:
-        dvx = dvx_max if dvx_max is not None else 2.0
-        dvy = dvy_max if dvy_max is not None else 2.0
-        dwfs = dwfs_max if dwfs_max is not None else 0.5
-        delta_scale = torch.tensor([dvx, dvy, dwfs], device=device, dtype=torch.float32)
+    # Build delta_scale tensor (always active — fill CLI overrides if given).
+    dvx = dvx_max if dvx_max is not None else 2.0
+    dvy = dvy_max if dvy_max is not None else 2.0
+    dwfs = dwfs_max if dwfs_max is not None else 10.0
+    delta_scale = torch.tensor([dvx, dvy, dwfs], device=device, dtype=torch.float32)
 
     physical_cost = PhysicalCEMCost(
         wrapped_model,
@@ -505,36 +577,47 @@ def visualize_cem_rollout(
         **lambda_kwargs,
     )
 
+    # ── Wrap in polar action space ──────────────────────────────────────
+    # CEM samples in (speed_mm_s, angle_rad, wfs_m_min) instead of (vx, vy, wfs).
+    # Noise on angle produces smooth turns; noise on speed changes magnitude only.
+    ACT_BLOCK = 4
+    polar_cost = PolarActionWrapper(physical_cost, action_block=ACT_BLOCK)
+
     # ── Build iCEM solver with callback ────────────────────────────────
     plan_cfg = swm.PlanConfig(horizon=horizon, receding_horizon=receding_horizon,
                                action_block=4, history_len=3, warm_start=True)
-    callback = CaptureBestRollout()
+    callback = CaptureBestRollout(cost_model=polar_cost)
     solver = ICEMSolver(
-        model=physical_cost, callbacks=[callback], device=device,
-        noise_beta=0.0,        # white noise (standard CEM) — avoids correlated "swirling"
-        num_samples=500,       # more samples for better exploration coverage
-        n_steps=30,            # default iterations
-        topk=50,               # slightly larger elite set
-        alpha=0.1,             # momentum (default)
-        n_elite_keep=5,        # elite injection (default)
-        # Per-dimension initial variance: [vx, vy, wfs] — solver auto-tiles to action_dim.
+        model=polar_cost, callbacks=[callback], device=device,
+        noise_beta=0.5,
+        num_samples=1000,
+        n_steps=20,
+        topk=30,
+        alpha=0.5,
+        n_elite_keep=5,
+        # Polar-space per-dimension initial variance: [speed (mm/s), angle (rad), wfs (m/min)].
+        # Speed: 5 mm/s std → ±15 mm/s 3σ.  Angle: 1.5 rad std — full-circle
+        # exploration with noise_beta=2 for temporally-smooth turns.
         var_scale=torch.tensor(
-            [15.0, 15.0, 3.0], device=device, dtype=torch.float32
+            # (speed, dx, dy, wfs) per substep — 4D
+            # speed: 5 mm/s std.  dx/dy: 0.05 std with noise_beta=2 →
+            # direction drifts ~0.5 rad over full horizon — smooth turns
+            # that can reach any quadrant without wrap-around.
+            [5.0, 0.8, 0.8, 8.0], device=device, dtype=torch.float32
         ),
     )
-    # iCEM clamps candidates to action bounds.  Use physical-space bounds
-    # so the solver explores in the units the geometric priors expect.
-    # Normalization to model space happens inside NormalizedCostModel.get_cost().
-    # CRITICAL: WFS lower bound is 0.0 (not min_wfs_m_min) so CEM can choose idle.
+    # 4D action space per substep: (speed, dx, dy, wfs).
+    # speed ∈ [0, v_max], dx/dy ∈ [-1, 1], wfs ∈ [0, wfs_max].
     from gymnasium.spaces import Box
     raw_as = env.action_space  # Box(shape=(3,), dtype=float32)
-    physical_low = raw_as.low.copy()
-    physical_low[2] = 0.0  # allow idle / no deposition
+    max_speed = float(np.sqrt(raw_as.high[0]**2 + raw_as.high[1]**2))
+    dd_low = np.array([0.0, -1.0, -1.0, 0.0], dtype=np.float32)
+    dd_high = np.array([max_speed, 1.0, 1.0, raw_as.high[2]], dtype=np.float32)
     batched_as = Box(
-        low=physical_low[np.newaxis, :],
-        high=raw_as.high[np.newaxis, :],
-        shape=(1,) + raw_as.shape,
-        dtype=raw_as.dtype,
+        low=dd_low[np.newaxis, :],
+        high=dd_high[np.newaxis, :],
+        shape=(1, 4),
+        dtype=np.float32,
     )
     solver.configure(
         action_space=batched_as, n_envs=1, config=plan_cfg,
@@ -671,34 +754,58 @@ def visualize_cem_rollout(
         orig_info = {k: v.clone() if isinstance(v, torch.Tensor) else v
                      for k, v in info_dict.items()}
 
-        # Warm-start CEM with shifted previous mean
+        # Warm-start CEM with shifted previous mean (in polar space).
         init_action = None
         if prev_mean is not None:
-            # prev_mean: [1, horizon, 12]; shift by receding_horizon, pad zeros
-            shifted = prev_mean[:, receding_horizon:, :]  # [1, horizon-RH, 12]
+            shifted = prev_mean[:, receding_horizon:, :]
             pad = torch.zeros(1, receding_horizon, prev_mean.shape[-1],
                               device=prev_mean.device, dtype=prev_mean.dtype)
-            init_action = torch.cat([shifted, pad], dim=1)  # [1, horizon, 12]
+            init_action = torch.cat([shifted, pad], dim=1)
+        else:
+            # First cycle: seed angle toward goal centroid so the solver
+            # can reach geometry in any direction (mean=0 only points right).
+            gy, gx = np.argwhere(goal_geom > 0.01).mean(axis=0)
+            goal_center_mm = np.array([
+                float(_attrs["x_min_mm"]) + gx * float(_attrs["dx"]),
+                float(_attrs["y_min_mm"]) + gy * float(_attrs["dx"]),
+            ])
+            start = np.asarray(start_xy, dtype=np.float32).ravel()
+            to_goal = goal_center_mm - start
+            init_angle = float(np.arctan2(to_goal[1], to_goal[0]))
+            init_speed = 5.0
+            init_dx = np.cos(init_angle)
+            init_dy = np.sin(init_angle)
+            init_wfs = 0.0
+            AD = ACT_BLOCK * 4  # 4D per substep: (speed, dx, dy, wfs)
+            init_polar = torch.zeros(1, horizon, AD, device=device, dtype=torch.float32)
+            for s in range(ACT_BLOCK):
+                init_polar[0, :, s * 4 + 0] = init_speed
+                init_polar[0, :, s * 4 + 1] = init_dx
+                init_polar[0, :, s * 4 + 2] = init_dy
+                init_polar[0, :, s * 4 + 3] = init_wfs
+            init_action = init_polar
+            print(f"  Polar seed: speed={init_speed:.0f} mm/s  "
+                  f"angle={np.degrees(init_angle):.0f}°  wfs={init_wfs:.1f} m/min")
 
+        callback.set_info(info_dict)
         outputs = solver.solve(info_dict, init_action=init_action)
-        best_mean = outputs["mean"][0]  # [1, horizon, action_dim]
-        if isinstance(best_mean, list):
-            best_mean = callback.best_mean[0] if callback.best_mean is not None else outputs["mean"][-1]
-        if best_mean.ndim == 3:
-            best_mean = best_mean[0]  # [horizon, action_dim]
+        best_mean_polar = outputs["mean"][0]  # [1, horizon, action_dim] — in (speed, dx, dy, wfs)
+        if isinstance(best_mean_polar, list):
+            best_mean_polar = callback.best_mean[0] if callback.best_mean is not None else outputs["mean"][-1]
+        if best_mean_polar.ndim == 3:
+            best_mean_polar = best_mean_polar[0]  # [horizon, action_dim]
+        # Convert to Cartesian for simulator execution.
+        best_mean = PolarActionWrapper.to_cartesian(best_mean_polar, action_block=ACT_BLOCK)
         # Cap how many steps we take this cycle
         take = min(receding_horizon, (total_steps - total_env_steps + 3) // 4)
         best_actions = best_mean[:take].to(device)
 
-        # Best actions are already in physical units (CEM sampled in physical space).
+        # Best actions are in Cartesian physical units — ready for env.step().
         # No denormalization needed — NormalizedCostModel normalizes internally.
         physical_actions = best_actions
 
-        # Save for next warm-start
-        if best_mean.ndim == 2:
-            prev_mean = best_mean.unsqueeze(0)  # [1, horizon, action_dim]
-        else:
-            prev_mean = best_mean
+        # Save polar best_mean for next-cycle warm-start (solver operates in polar).
+        prev_mean = best_mean_polar.unsqueeze(0)  # [1, horizon, action_dim]
 
         cost_info = (
             f"cost trend: {callback.cost_history[0]:.1f} → {callback.cost_history[-1]:.1f}"

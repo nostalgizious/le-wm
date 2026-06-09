@@ -68,14 +68,14 @@ predictor:
 
 loss:
   sigreg:
-    weight: 0.1
+    weight: 0.2
     kwargs:
       knots: 17
       num_proj: 1024
 
 probe:
   enabled: false  # default off; set true for validation runs
-  max_probe_samples: 2000  # cap validation frames for probe fitting
+  max_probe_samples: 500  # cap validation frames for probe fitting
   limit_val_batches: 16    # max batches per validation (2000 / 128 ≈ 16)
   mlp_fit:
     epochs: 20

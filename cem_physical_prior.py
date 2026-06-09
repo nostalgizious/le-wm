@@ -499,19 +499,19 @@ class PhysicalCEMCost:
         action_block: int = 4,
         phys_dt: float = 0.25,
         min_wfs_m_min: float = 1.5,
-        allowed_radius_mm: float = 6.0,
+        allowed_radius_mm: float = 3.0,
         nominal_ratio: float = 0.5,
         ratio_max: float = 2.0,
         action_std: torch.Tensor | None = None,
-        lambda_latent: float = 1.0,
-        lambda_off: float = 100.0,
+        lambda_latent: float = 200.0,
+        lambda_off: float = 10.0,
         lambda_dir: float = 20.0,
         lambda_over: float = 10.0,
-        lambda_smooth: float = 0.01,     # weak block-level regularizer only
-        lambda_prog: float = 30.0,
+        lambda_smooth: float = 0.5,     # weak block-level regularizer only
+        lambda_prog: float = 100.0,
         # ── Raw-step dynamics (WAAM-specific, 0.25 s resolution) ──
-        lambda_rate_v: float = 5.0,
-        lambda_rate_wfs: float = 2.0,
+        lambda_rate_v: float = 2.0,
+        lambda_rate_wfs: float = 0.5,
         lambda_accel: float = 0.0,
         lambda_slew: float = 10.0,
         delta_scale: torch.Tensor | None = None,   # [3] per-step allowed change
@@ -679,3 +679,103 @@ class PhysicalCEMCost:
             "progress_cost": -self.lambda_prog * progress_reward,
             "total": total,
         }
+
+
+class PolarActionWrapper:
+    """Wraps a cost model so iCEM samples in (speed, dx, dy, wfs) space.
+
+    The ``(dx, dy)`` pair represents a direction vector — it gets normalised
+    to unit length, then multiplied by speed to get ``(vx, vy)``.  This
+    replaces ``(speed, angle)`` polar sampling and **avoids angle wrap-around**
+    at ±π, which destroys iCEM's Gaussian-distribution assumptions.
+
+    Noise on ``(dx, dy)`` with ``noise_beta=2`` produces smooth direction
+    changes because the raw (dx,dy) components drift continuously — no
+    circular-topology discontinuity.
+
+    Usage::
+
+        cartesian_model = PhysicalCEMCost(...)
+        polarmodel = PolarActionWrapper(cartesian_model, action_block=4)
+        solver = ICEMSolver(model=polarmodel, ...)
+
+        # Convert Cartesian warm-start to (speed, dx, dy, wfs) before solving:
+        init = PolarActionWrapper.to_polar(warm_start_cartesian, 4)
+        outputs = solver.solve(info, init_action=init)
+
+        # Convert best from (speed, dx, dy, wfs) back to Cartesian:
+        best_cartesian = PolarActionWrapper.to_cartesian(outputs["actions"], 4)
+    """
+
+    def __init__(self, model, action_block: int = 4):
+        self._model = model
+        self.action_block = action_block
+
+    def parameters(self):
+        return self._model.parameters()
+
+    # ── Core conversion: (speed, dx, dy, wfs) → (vx, vy, wfs) ──────────
+
+    def _to_cartesian(self, dd: "torch.Tensor") -> "torch.Tensor":
+        """dd in (speed, dx, dy, wfs) per substep → (vx, vy, wfs)."""
+        import torch as _torch
+        if dd.shape[-1] != self.action_block * 4:
+            raise RuntimeError(
+                f"PolarActionWrapper: expected last dim {self.action_block * 4} "
+                f"(action_block={self.action_block} × 4), got shape {list(dd.shape)}"
+            )
+        B, N, H, AD = dd.shape
+        block = self.action_block
+        raw = dd.reshape(B, N, H, block, 4)  # (speed, dx, dy, wfs)
+        speed = raw[..., 0].clamp(min=0.0)
+        dx = raw[..., 1]
+        dy = raw[..., 2]
+        wfs = raw[..., 3]
+        norm = _torch.sqrt(dx**2 + dy**2).clamp(min=1e-8)
+        vx = speed * dx / norm
+        vy = speed * dy / norm
+        out_dim = block * 3  # (vx, vy, wfs) per substep
+        return _torch.stack([vx, vy, wfs], dim=-1).reshape(B, N, H, out_dim)
+
+    # ── CostModel protocol ─────────────────────────────────────────────
+
+    def get_cost(self, info_dict, dd):
+        return self._model.get_cost(info_dict, self._to_cartesian(dd))
+
+    def compute_components(self, info_dict, dd):
+        return self._model.compute_components(info_dict, self._to_cartesian(dd))
+
+    # ── Static helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def to_polar(
+        cartesian: "torch.Tensor | None", action_block: int = 4,
+    ) -> "torch.Tensor | None":
+        """Cartesian [..., H, AD] → (speed, dx, dy, wfs) [... H, AD+?]."""
+        import torch as _torch
+        if cartesian is None:
+            return None
+        *prefix, H, AD = cartesian.shape
+        raw = cartesian.reshape(*prefix, H, action_block, 3)
+        vx, vy, wfs = raw[..., 0], raw[..., 1], raw[..., 2]
+        speed = _torch.sqrt(vx**2 + vy**2).clamp(min=1e-8)
+        dx = vx / speed
+        dy = vy / speed
+        return _torch.stack([speed, dx, dy, wfs], dim=-1).reshape(*prefix, H, action_block * 4)
+
+    @staticmethod
+    def to_cartesian(
+        dd: "torch.Tensor | None", action_block: int = 4,
+    ) -> "torch.Tensor | None":
+        """(speed, dx, dy, wfs) [..., H, AD'] → Cartesian [..., H, AD]."""
+        import torch as _torch
+        if dd is None:
+            return None
+        *prefix, H, AD4 = dd.shape
+        raw = dd.reshape(*prefix, H, action_block, 4)
+        speed, dx, dy, wfs = raw[..., 0], raw[..., 1], raw[..., 2], raw[..., 3]
+        norm = _torch.sqrt(dx**2 + dy**2).clamp(min=1e-8)
+        vx = speed * dx / norm
+        vy = speed * dy / norm
+        out_dim = action_block * 3
+        return _torch.stack([vx, vy, wfs], dim=-1).reshape(*prefix, H, out_dim)

@@ -28,7 +28,7 @@ plan_config:
 eval:
   num_eval: 50
   goal_offset_steps: 25
-  eval_budget: 150
+  eval_budget: 600
   img_size: 128
   dataset_name: ???
   callables:
